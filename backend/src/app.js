@@ -876,6 +876,49 @@ const syncDatabaseSchema = async () => {
             console.error('>>> [DB-SYNC-ERROR]: attendance_entry_requests sync failed:', e.message);
         }
 
+        // 14. Ensure attendance table carries shift_id (the shift PINNED to the session)
+        // The attendance table pre-exists everywhere, so this block only ever ALTERs.
+        //
+        // shift_id records which shift the ingestion engine judged this session against, as
+        // resolved at CHECK-IN time. Every later punch on the same open row was previously
+        // re-resolved from employee_shift_assignments by date, so an admin who changed an
+        // employee's shift effective today — a mid-day rotation entry, which clients do
+        // routinely — moved the goalposts under a session that was already open: the genuine
+        // checkout was then measured against a shift the employee had not worked and was
+        // discarded as 'Punch out prior to shift start', leaving the row open forever.
+        // Reproduced 2026-09-22 with employee QA023: in 09:00, reassigned to a 22:00-06:00
+        // shift the same day, out 18:00 -> punch dropped, row orphaned.
+        //
+        // Pinning the shift on the row makes the session self-describing, so the answer no
+        // longer depends on what the roster says at the moment the second punch arrives.
+        //
+        // Nullable, no default, no FK:
+        //   - every row written before this column exists has NULL, and the engine must keep
+        //     falling back to date-based resolution for those. That fallback is what makes
+        //     this change backward compatible; a backfill is a separate, deliberate operation.
+        //   - a DEFAULT would be a lie (there is no single correct shift for a historical row)
+        //     and would rewrite the whole table on ALTER.
+        //   - no FOREIGN KEY: tenants delete and recreate shifts freely, and a shift that is
+        //     gone must not be able to invalidate an attendance row that already happened.
+        //     A constraint here would also be a new way for this boot-time ALTER to fail on
+        //     precisely the environments carrying the messiest data.
+        // int unsigned to match shifts.id (int unsigned auto_increment).
+        try {
+            const hasAttendanceTableForShift = await db.schema.hasTable('attendance');
+            if (hasAttendanceTableForShift) {
+                const hasShiftId = await db.schema.hasColumn('attendance', 'shift_id');
+                if (!hasShiftId) {
+                    console.log('>>> [DB-SYNC]: Adding shift_id column to attendance table...');
+                    await db.schema.alterTable('attendance', (table) => {
+                        table.integer('shift_id').unsigned().nullable();
+                    });
+                    console.log('>>> [DB-SYNC]: shift_id column added to attendance table.');
+                }
+            }
+        } catch (e) {
+            console.error('>>> [DB-SYNC-ERROR]: attendance shift_id sync failed:', e.message);
+        }
+
     } catch (err) {
         console.error('>>> [DB-SYNC-ERROR]:', err.message);
     }

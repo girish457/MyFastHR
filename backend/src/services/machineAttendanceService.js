@@ -135,8 +135,95 @@ const REVIEW_REASONS = {
     EARLY_BEFORE_IN_MARGIN: 'early_before_in_margin',
     // An open row was closed by a punch that arrived after the shift's terminate_hour.
     // Almost always means the assigned shift does not match the hours actually worked.
-    CLOSED_AFTER_TERMINATION: 'closed_after_termination'
+    CLOSED_AFTER_TERMINATION: 'closed_after_termination',
+    // The mirror image of the above: an open row was closed by a punch that lands BEFORE the
+    // start time of the shift the row is being judged against. That is only possible when the
+    // shift the row is judged against is not the shift the employee worked - either the row
+    // pre-dates attendance.shift_id and its session shift had to be re-resolved by date, or
+    // the roster was edited between the two punches. The punch is recorded rather than
+    // discarded, and flagged so the day is reviewable.
+    CLOSED_BEFORE_SHIFT_START: 'closed_before_shift_start'
 };
+
+// Every place that resolves an employee_shift_assignments row onto `employeeWithShift` selects
+// exactly these columns under exactly these aliases. It was written out three times, and a
+// column added to one copy but not the others is silently a different shift. `assigned_shift_id`
+// is deliberately NOT aliased to `shift_id`: that name already belongs to employees.shift_id on
+// the same object (the profile default), which the termination path still reads as a fallback.
+const ASSIGNED_SHIFT_COLUMNS = [
+    's.id as assigned_shift_id',
+    's.is_flexi',
+    's.min_hours',
+    's.start_time',
+    's.end_time',
+    's.grace_period as shift_grace',
+    's.grace_count_limit as shift_grace_count_limit',
+    's.total_punches_required as shift_total_punches',
+    's.session1_in_margin as shift_in_margin',
+    's.session1_out_margin as shift_out_margin',
+    's.session2_start_time',
+    's.session2_end_time',
+    's.session2_in_margin',
+    's.session2_out_margin',
+    's.session1_grace_out',
+    's.session2_grace_in',
+    's.session2_grace_out',
+    's.terminate_hour as shift_terminate_hour'
+];
+
+/** Projects a shift row selected with ASSIGNED_SHIFT_COLUMNS over the employee's own shift. */
+function applyResolvedShift(employeeWithShift, shift) {
+    if (!employeeWithShift || !shift) return;
+    employeeWithShift.shift_is_flexi = shift.is_flexi;
+    employeeWithShift.min_hours = shift.min_hours;
+    employeeWithShift.shift_start = shift.start_time;
+    employeeWithShift.shift_end = shift.end_time;
+    employeeWithShift.shift_grace = shift.shift_grace;
+    employeeWithShift.shift_grace_count_limit = shift.shift_grace_count_limit;
+    employeeWithShift.shift_total_punches = shift.shift_total_punches;
+    employeeWithShift.shift_in_margin = shift.shift_in_margin;
+    employeeWithShift.shift_out_margin = shift.shift_out_margin;
+    employeeWithShift.session2_start_time = shift.session2_start_time;
+    employeeWithShift.session2_end_time = shift.session2_end_time;
+    employeeWithShift.session2_in_margin = shift.session2_in_margin;
+    employeeWithShift.session2_out_margin = shift.session2_out_margin;
+    employeeWithShift.session1_grace_out = shift.session1_grace_out;
+    employeeWithShift.session2_grace_in = shift.session2_grace_in;
+    employeeWithShift.session2_grace_out = shift.session2_grace_out;
+    employeeWithShift.shift_terminate_hour = shift.shift_terminate_hour;
+}
+
+/**
+ * The shift in force for this employee on `targetDate`, or null when none covers it.
+ *
+ * Ordered from_date DESC then id DESC, which is the rule ATTENDANCE_TROUBLESHOOTING.md records
+ * as the fix for the "Shift Assignment Priority Bug" and which attendanceService and
+ * looksLikeArrivalOnPunchDay below already follow. The three copies this helper replaces
+ * ordered by id alone, so whenever an employee carries several overlapping open-ended
+ * assignments - measured 2026-09-05 as 164 of 231 active employees at one client - the shift
+ * that won was whichever row happened to be inserted last, not the one whose rotation started
+ * most recently. Ingestion and the muster could therefore judge the same day by different
+ * shifts, which is the whole class of bug this branch exists to close.
+ */
+function assignedShiftForDate(db, employeeId, targetDate) {
+    return db('employee_shift_assignments as esa')
+        .join('shifts as s', 'esa.shift_id', 's.id')
+        .where('esa.employee_id', employeeId)
+        .where('esa.from_date', '<=', targetDate)
+        .andWhere(qb => {
+            qb.where('esa.to_date', '>=', targetDate).orWhereNull('esa.to_date');
+        })
+        .select(ASSIGNED_SHIFT_COLUMNS)
+        .orderBy('esa.from_date', 'desc')
+        .orderBy('esa.id', 'desc')
+        .first();
+}
+
+/** One shift by id, in the same shape assignedShiftForDate returns. */
+function shiftById(db, shiftId) {
+    if (!shiftId) return Promise.resolve(null);
+    return db('shifts as s').where('s.id', shiftId).select(ASSIGNED_SHIFT_COLUMNS).first();
+}
 
 /**
  * Decides what a punch arriving after an open row's shift has terminated actually is.
@@ -578,6 +665,7 @@ class MachineAttendanceService {
                         qb.where('esa.to_date', '>=', prevDateStr).orWhereNull('esa.to_date');
                     })
                     .select('s.*')
+                    .orderBy('esa.from_date', 'desc')
                     .orderBy('esa.id', 'desc')
                     .first();
 
@@ -611,54 +699,50 @@ class MachineAttendanceService {
             targetShiftDate = dateToISTDateString(dbDateToUTC(activeLog.check_in));
         }
 
+        // The shift this punch is judged against, and the id stamped on any row it opens.
+        // Starts as the employee's profile default and is overwritten below by whichever
+        // shift actually wins.
+        let resolvedShiftId = employeeWithShift?.shift_id || null;
+
+        // THE SHIFT IS PINNED TO THE SESSION, NOT RE-RESOLVED PER PUNCH.
+        //
+        // Re-resolving from employee_shift_assignments on every punch means an admin who
+        // reassigns an employee effective TODAY moves the goalposts under a session that is
+        // already open: the check-in was accepted under the old shift, the checkout is then
+        // measured against the new one. Reproduced 2026-09-22, employee QA023 - in at 09:00 on
+        // a 09:00-18:00 shift, reassigned mid-session to a 22:00-06:00 night shift effective
+        // the same day, out at 18:00 -> 'Punch out prior to shift start', the punch discarded
+        // and the row orphaned open forever. Mid-day rotation entry is routine admin work, so
+        // this fires for a real share of the daily issue count, not a corner case.
+        //
+        // attendance.shift_id records what the session was actually opened under, so a later
+        // punch on that row can ask the row instead of the roster. Every row written before
+        // that column existed has it NULL and still falls back to the date-based resolution
+        // below - that fallback is exactly today's behaviour, which is what keeps this change
+        // backward compatible on production data.
+        let pinnedShift = null;
         if (employeeWithShift) {
-            const activeAssignment = await db('employee_shift_assignments as esa')
-                .join('shifts as s', 'esa.shift_id', 's.id')
-                .where('esa.employee_id', employeeId)
-                .where('esa.from_date', '<=', targetShiftDate)
-                .andWhere(qb => {
-                    qb.where('esa.to_date', '>=', targetShiftDate).orWhereNull('esa.to_date');
-                })
-                .select(
-                    's.is_flexi',
-                    's.min_hours',
-                    's.start_time',
-                    's.end_time',
-                    's.grace_period as shift_grace',
-                    's.grace_count_limit as shift_grace_count_limit',
-                    's.total_punches_required as shift_total_punches',
-                    's.session1_in_margin as shift_in_margin',
-                    's.session1_out_margin as shift_out_margin',
-                    's.session2_start_time',
-                    's.session2_end_time',
-                    's.session2_in_margin',
-                    's.session2_out_margin',
-                    's.session1_grace_out',
-                    's.session2_grace_in',
-                    's.session2_grace_out',
-                    's.terminate_hour as shift_terminate_hour'
-                )
-                .orderBy('esa.id', 'desc')
+            // activeLog here is only ever the previous-day open row; the same-day open row is
+            // not picked up until latestLog below, so look for it directly. Bounded by
+            // NEAR_ROW_WINDOW_MS for the same reason the rescue guards are: beyond one
+            // plausible worked shift an open row is stale, not this punch's session.
+            const openSessionRow = activeLog || await db('attendance')
+                .where({ employee_id: employeeId, company_id: companyId })
+                .whereNull('check_out')
+                .where('check_in', '<=', punchTimeStr)
+                .where('check_in', '>=', toLocalYYYYMMDDHHmmss(new Date(punchTime.getTime() - NEAR_ROW_WINDOW_MS)))
+                .orderBy('check_in', 'desc')
                 .first();
 
+            if (openSessionRow && openSessionRow.shift_id) {
+                pinnedShift = await shiftById(db, openSessionRow.shift_id);
+            }
+
+            const activeAssignment = pinnedShift || await assignedShiftForDate(db, employeeId, targetShiftDate);
+
             if (activeAssignment) {
-                employeeWithShift.shift_is_flexi = activeAssignment.is_flexi;
-                employeeWithShift.min_hours = activeAssignment.min_hours;
-                employeeWithShift.shift_start = activeAssignment.start_time;
-                employeeWithShift.shift_end = activeAssignment.end_time;
-                employeeWithShift.shift_grace = activeAssignment.shift_grace;
-                employeeWithShift.shift_grace_count_limit = activeAssignment.shift_grace_count_limit;
-                employeeWithShift.shift_total_punches = activeAssignment.shift_total_punches;
-                employeeWithShift.shift_in_margin = activeAssignment.shift_in_margin;
-                employeeWithShift.shift_out_margin = activeAssignment.shift_out_margin;
-                employeeWithShift.session2_start_time = activeAssignment.session2_start_time;
-                employeeWithShift.session2_end_time = activeAssignment.session2_end_time;
-                employeeWithShift.session2_in_margin = activeAssignment.session2_in_margin;
-                employeeWithShift.session2_out_margin = activeAssignment.session2_out_margin;
-                employeeWithShift.session1_grace_out = activeAssignment.session1_grace_out;
-                employeeWithShift.session2_grace_in = activeAssignment.session2_grace_in;
-                employeeWithShift.session2_grace_out = activeAssignment.session2_grace_out;
-                employeeWithShift.shift_terminate_hour = activeAssignment.shift_terminate_hour;
+                applyResolvedShift(employeeWithShift, activeAssignment);
+                resolvedShiftId = activeAssignment.assigned_shift_id;
             }
         }
 
@@ -807,6 +891,7 @@ class MachineAttendanceService {
                             qb.where('esa.to_date', '>=', prevDateStr).orWhereNull('esa.to_date');
                         })
                         .select('s.*')
+                        .orderBy('esa.from_date', 'desc')
                         .orderBy('esa.id', 'desc')
                         .first();
 
@@ -837,55 +922,40 @@ class MachineAttendanceService {
                     }
                 }
 
-                // Reload the active shift assignment for the new targetShiftDate
-                const activeAssignment = await db('employee_shift_assignments as esa')
-                    .join('shifts as s', 'esa.shift_id', 's.id')
-                    .where('esa.employee_id', employeeId)
-                    .where('esa.from_date', '<=', targetShiftDate)
-                    .andWhere(qb => {
-                        qb.where('esa.to_date', '>=', targetShiftDate).orWhereNull('esa.to_date');
-                    })
-                    .select(
-                        's.is_flexi',
-                        's.min_hours',
-                        's.start_time',
-                        's.end_time',
-                        's.grace_period as shift_grace',
-                        's.grace_count_limit as shift_grace_count_limit',
-                        's.total_punches_required as shift_total_punches',
-                        's.session1_in_margin as shift_in_margin',
-                        's.session1_out_margin as shift_out_margin',
-                        's.session2_start_time',
-                        's.session2_end_time',
-                        's.session2_in_margin',
-                        's.session2_out_margin',
-                        's.session1_grace_out',
-                        's.session2_grace_in',
-                        's.session2_grace_out',
-                        's.terminate_hour as shift_terminate_hour'
-                    )
-                    .orderBy('esa.id', 'desc')
-                    .first();
+                // Reload the active shift assignment for the new targetShiftDate.
+                //
+                // The pin belonged to the row we just abandoned. This punch is being treated
+                // as a fresh arrival on its own day, so it must be judged - and stamped - by
+                // the roster in force on THAT day, not by the shift of a session it is no
+                // longer part of. When no assignment covers the day we fall back to the
+                // employee's profile shift explicitly rather than leaving whatever was
+                // resolved earlier in place; with no pin that is the same object the initial
+                // join produced, so this is a no-op on the pre-existing path.
+                pinnedShift = null;
+                const reloadedShift = await assignedShiftForDate(db, employeeId, targetShiftDate)
+                    || await shiftById(db, employeeWithShift.shift_id);
 
-                if (activeAssignment) {
-                    employeeWithShift.shift_is_flexi = activeAssignment.is_flexi;
-                    employeeWithShift.min_hours = activeAssignment.min_hours;
-                    employeeWithShift.shift_start = activeAssignment.start_time;
-                    employeeWithShift.shift_end = activeAssignment.end_time;
-                    employeeWithShift.shift_grace = activeAssignment.shift_grace;
-                    employeeWithShift.shift_grace_count_limit = activeAssignment.shift_grace_count_limit;
-                    employeeWithShift.shift_total_punches = activeAssignment.shift_total_punches;
-                    employeeWithShift.shift_in_margin = activeAssignment.shift_in_margin;
-                    employeeWithShift.shift_out_margin = activeAssignment.shift_out_margin;
-                    employeeWithShift.session2_start_time = activeAssignment.session2_start_time;
-                    employeeWithShift.session2_end_time = activeAssignment.session2_end_time;
-                    employeeWithShift.session2_in_margin = activeAssignment.session2_in_margin;
-                    employeeWithShift.session2_out_margin = activeAssignment.session2_out_margin;
-                    employeeWithShift.session1_grace_out = activeAssignment.session1_grace_out;
-                    employeeWithShift.session2_grace_in = activeAssignment.session2_grace_in;
-                    employeeWithShift.session2_grace_out = activeAssignment.session2_grace_out;
-                    employeeWithShift.shift_terminate_hour = activeAssignment.shift_terminate_hour;
+                if (reloadedShift) {
+                    applyResolvedShift(employeeWithShift, reloadedShift);
+                    resolvedShiftId = reloadedShift.assigned_shift_id;
                 }
+            }
+        }
+
+        // A pin describes the session an OPEN row started under. If this punch turns out not
+        // to be acting on that row - it is a fresh arrival, or the row it would have closed
+        // was abandoned above - the pin no longer applies and the punch must be judged, and
+        // stamped, by the roster in force on its own day. Reverting here rather than never
+        // pinning at all is deliberate: it keeps every decision above (session routing, the
+        // checkout window, the termination rules) running on one consistent shift instead of
+        // half on the session's and half on the roster's.
+        if (!activeLog && pinnedShift && employeeWithShift) {
+            pinnedShift = null;
+            const dateResolvedShift = await assignedShiftForDate(db, employeeId, targetShiftDate)
+                || await shiftById(db, employeeWithShift.shift_id);
+            if (dateResolvedShift) {
+                applyResolvedShift(employeeWithShift, dateResolvedShift);
+                resolvedShiftId = dateResolvedShift.assigned_shift_id;
             }
         }
 
@@ -1163,6 +1233,11 @@ class MachineAttendanceService {
                 // is order-dependent when an employee has overlapping open-ended shift
                 // assignments - the norm in this data.
                 logical_date: targetShiftDate,
+                // The shift this session was opened under, pinned so that every later punch
+                // on this row is judged by it even if the roster is edited in between. This
+                // is the only place it is written: a row's shift is decided once, at the
+                // moment the session starts. NULL only for rows that pre-date the column.
+                shift_id: resolvedShiftId,
                 review_reason: checkoutWindowNote
                     ? REVIEW_REASONS.CHECKOUT_WINDOW_UNPAIRED
                     : (inMarginNote ? REVIEW_REASONS.EARLY_BEFORE_IN_MARGIN : null),
@@ -1302,6 +1377,9 @@ class MachineAttendanceService {
             let halfDayLimit = 4; // default
             let shiftEndDate = null;
             let outMarginThreshold = null;
+            // Set when the before-shift-start guard below closes an open row instead of
+            // discarding the punch; recorded on the row and in the audit log.
+            let beforeShiftStartNote = null;
 
             if (isFlexi) {
                 const minHours = parseFloat(employee?.min_hours) || 8;
@@ -1324,17 +1402,44 @@ class MachineAttendanceService {
                     shiftEndDate = new Date(shiftEndDate.getTime() + 24 * 60 * 60 * 1000);
                 }
 
-                // 1. PUNCH OUT BEFORE SHIFT START: Ignore / Skip punch
+                // 1. PUNCH OUT BEFORE SHIFT START
+                //
+                // The guard exists for a punch that really does land before the shift began
+                // with nothing to close - a stray tap that must not be written anywhere. But
+                // it used to fire on an OPEN row too, and then it destroyed the exit that
+                // would have closed it: the row stayed check_in-only forever and the punch
+                // survived only in biometric_raw_logs. That happens whenever the shift this
+                // row is being judged against is not the shift the employee worked - a row
+                // written before attendance.shift_id existed (so its session shift had to be
+                // re-resolved by date), or a roster edited between the two punches. QA023,
+                // 2026-09-22: in 09:00, reassigned mid-session to a 22:00 shift, out 18:00 -
+                // 18:00 is "before shift start" and the day was lost.
+                //
+                // Span is the honest test here, the same one assessPunchAfterTermination
+                // uses: if the gap since check-in is a shift a human could have worked, this
+                // punch closes the row. It is recorded and flagged rather than discarded,
+                // because a real punch must never be silently lost. A closed activeLog (the
+                // 2-punch fallback hands one over routinely) has nothing to close, so it
+                // still takes the original skip.
                 if (punchTime < shiftStartDate) {
-                    await db('biometric_raw_logs').insert({
-                        company_id: companyId,
-                        device_serial: deviceSerial,
-                        employee_code,
-                        punch_time: punchTimeStr,
-                        status: 'skipped',
-                        error_details: 'Punch out prior to shift start time'
-                    });
-                    return { status: 'skipped', reason: 'Punch out prior to shift start' };
+                    const gapHours = (punchTime.getTime() - checkIn.getTime()) / (1000 * 60 * 60);
+                    const closesOpenRow = activeLog.check_out === null
+                        && gapHours > 0
+                        && gapHours <= MAX_PLAUSIBLE_WORKED_HOURS;
+
+                    if (!closesOpenRow) {
+                        await db('biometric_raw_logs').insert({
+                            company_id: companyId,
+                            device_serial: deviceSerial,
+                            employee_code,
+                            punch_time: punchTimeStr,
+                            status: 'skipped',
+                            error_details: 'Punch out prior to shift start time'
+                        });
+                        return { status: 'skipped', reason: 'Punch out prior to shift start' };
+                    }
+
+                    beforeShiftStartNote = `Closed before the assigned shift start (${shiftStart}): punch is ${gapHours.toFixed(2)}h after check-in, which is within a plausible worked shift. The shift this row is judged against is not the one that was worked - most often the roster was changed after the session opened.`;
                 }
 
                 // Determine half day hours limit
@@ -1433,7 +1538,12 @@ class MachineAttendanceService {
             // gets closed later that day.
             const resolvedReviewReason = lateTerminationNote
                 ? REVIEW_REASONS.CLOSED_AFTER_TERMINATION
-                : (wasUnpaired ? null : (activeLog.review_reason || null));
+                : (beforeShiftStartNote
+                    ? REVIEW_REASONS.CLOSED_BEFORE_SHIFT_START
+                    : (wasUnpaired ? null : (activeLog.review_reason || null)));
+
+            // Both close-anyway rescues write a note; only one can be set on a given punch.
+            const checkoutAuditNote = lateTerminationNote || beforeShiftStartNote;
 
             // Check if there is an approved Entry/Exit Request for this date and type 'early_out'
             const approvedRequest = await db('attendance_entry_requests')
@@ -1478,7 +1588,7 @@ class MachineAttendanceService {
                     employee_code,
                     punch_time: punchTimeStr,
                     status: 'synced',
-                    error_details: lateTerminationNote
+                    error_details: checkoutAuditNote
                 });
 
                 return { status: 'check-out', record_status: 'pending' };
@@ -1536,7 +1646,7 @@ class MachineAttendanceService {
                 employee_code,
                 punch_time: punchTimeStr,
                 status: 'synced',
-                error_details: lateTerminationNote
+                error_details: checkoutAuditNote
             });
 
             return { status: 'check-out' };

@@ -54,6 +54,8 @@ const SHIFT_DAY = 990010;      // 06:00-16:00, the shift most Highway King staff
 const SHIFT_NIGHT = 990011;    // 16:00-02:00, crosses midnight
 const SHIFT_FLEXI = 990012;
 const SHIFT_SPLIT = 990013;    // 4-punch
+const SHIFT_LATE = 990014;     // 12:00-21:00, starts later than SHIFT_DAY and ends later
+const SHIFT_SPLIT_LATE = 990015; // 4-punch, 09:00-13:00 / 19:00-23:30
 
 let employeeSeq = 990100;
 
@@ -95,7 +97,9 @@ async function seedCommon() {
         { ...baseShift, id: SHIFT_DAY, name: 'Replay 06-16', start_time: '06:00', end_time: '16:00' },
         { ...baseShift, id: SHIFT_NIGHT, name: 'Replay 16-02', start_time: '16:00', end_time: '02:00' },
         { ...baseShift, id: SHIFT_FLEXI, name: 'Replay Flexi', start_time: '00:00', end_time: '23:59', is_flexi: 1, session1_in_margin: 0, session1_out_margin: 0, terminate_hour: null },
-        { ...baseShift, id: SHIFT_SPLIT, name: 'Replay Split', start_time: '07:00', end_time: '12:00', total_punches_required: 4, session2_start_time: '18:00', session2_end_time: '23:00', session2_in_margin: 30, session2_out_margin: 5 }
+        { ...baseShift, id: SHIFT_SPLIT, name: 'Replay Split', start_time: '07:00', end_time: '12:00', total_punches_required: 4, session2_start_time: '18:00', session2_end_time: '23:00', session2_in_margin: 30, session2_out_margin: 5 },
+        { ...baseShift, id: SHIFT_LATE, name: 'Replay 12-21', start_time: '12:00', end_time: '21:00' },
+        { ...baseShift, id: SHIFT_SPLIT_LATE, name: 'Replay Split Late', start_time: '09:00', end_time: '13:00', total_punches_required: 4, session2_start_time: '19:00', session2_end_time: '23:30', session2_in_margin: 30, session2_out_margin: 5 }
     ]);
 }
 
@@ -119,6 +123,31 @@ async function makeEmployee(assignedShift, { fromDate = '2026-01-01', assign = t
     return { id, code };
 }
 
+/**
+ * Reproduces what attendanceService.assignShift does for a PERMANENT reassignment - close the
+ * running open-ended assignment the day before the new one starts, drop any open assignment
+ * that starts on or after it, then insert the new one. Written out here rather than calling
+ * the service so this stays a pure punch-engine harness with no HTTP/auth surface, but it must
+ * keep matching that method: an admin editing a roster mid-day is the scenario under test.
+ */
+async function reassign(employeeId, shiftId, fromDate) {
+    const prevDay = new Date(new Date(`${fromDate}T12:00:00Z`).getTime() - 24 * 60 * 60 * 1000)
+        .toISOString().slice(0, 10);
+    await db('employee_shift_assignments')
+        .where({ company_id: CO, employee_id: employeeId })
+        .whereNull('to_date')
+        .where('from_date', '<', fromDate)
+        .update({ to_date: prevDay });
+    await db('employee_shift_assignments')
+        .where({ company_id: CO, employee_id: employeeId })
+        .whereNull('to_date')
+        .where('from_date', '>=', fromDate)
+        .del();
+    await db('employee_shift_assignments').insert({
+        company_id: CO, employee_id: employeeId, shift_id: shiftId, from_date: fromDate, to_date: null
+    });
+}
+
 const punch = (code, timestamp) => machineAttendanceService.processPunch(CO, DEVICE, { employee_code: code, timestamp });
 
 async function rowsFor(employeeId) {
@@ -130,6 +159,12 @@ async function rowsFor(employeeId) {
         source: r.punch_source,
         review: r.review_reason || null
     }));
+}
+
+/** The shift pinned to each of an employee's rows, in check-in order. */
+async function shiftIdsFor(employeeId) {
+    const rows = await db('attendance').where({ employee_id: employeeId, company_id: CO }).orderBy('check_in', 'asc');
+    return rows.map(r => (r.shift_id === null || r.shift_id === undefined ? null : Number(r.shift_id)));
 }
 
 async function requestsFor(employeeId) {
@@ -475,6 +510,193 @@ async function scenarioSplitShift() {
     check(s, 'session 2 closed', rows[1].out, '2026-09-10 23:00:00');
 }
 
+/**
+ * The defect that discards a checkout when the roster moves under an open session.
+ *
+ * Reproduced live twice, 2026-09-22, employee QA023: in at 09:00 on a 09:00-18:00 shift, admin
+ * reassigns them to a 22:00-06:00 night shift effective the SAME day, out at 18:00 ->
+ * { status: 'skipped', reason: 'Punch out prior to shift start' } and the row orphaned open
+ * forever. The shift was re-resolved by date on every punch, so the checkout was judged
+ * against a shift the employee had not worked. Entering a rotation mid-day is routine admin
+ * work, which is why this is worth a column on the table.
+ *
+ * Here: day session, reassigned mid-session to a LATER-starting shift.
+ */
+async function scenarioMidSessionReassignLaterShift() {
+    const s = 'mid-session reassignment to a later shift';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    await reassign(e.id, SHIFT_NIGHT, '2026-09-10');   // 16:00-02:00, effective mid-session
+    const exit = await punch(e.code, '2026-09-10 15:57:00');
+
+    check(s, 'the exit is recorded, not skipped', exit.status, 'check-out');
+    // Judged against the 06:00-16:00 shift actually worked: 15:57 is inside its 5-minute
+    // out-margin, so this is an ordinary complete day with nothing to review.
+    check(s, 'closed against the ORIGINAL shift', await rowsFor(e.id), [
+        { in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present', source: 'biometric', review: null }
+    ]);
+    check(s, 'the row stays pinned to the shift it opened under', await shiftIdsFor(e.id), [SHIFT_DAY]);
+    check(s, 'no request raised', await requestsFor(e.id), []);
+}
+
+/**
+ * The mirror case: reassigned mid-session to an EARLIER-starting shift. Nothing here would be
+ * skipped even unfixed, so the assertion is about which shift the day is judged by. Leaving at
+ * 19:00 is two hours early against the 12:00-21:00 shift actually worked (early_out, pending
+ * approval); against the 06:00-16:00 shift the roster now claims it is a late exit past
+ * termination. Only one of those is the truth about the employee's day.
+ */
+async function scenarioMidSessionReassignEarlierShift() {
+    const s = 'mid-session reassignment to an earlier shift';
+    const e = await makeEmployee(SHIFT_LATE);
+    await punch(e.code, '2026-09-10 12:00:00');
+    await reassign(e.id, SHIFT_DAY, '2026-09-10');   // 06:00-16:00, effective mid-session
+    await punch(e.code, '2026-09-10 19:00:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'closed by the real exit', rows[0].out, '2026-09-10 19:00:00');
+    check(s, 'early against the shift worked, so pending approval', rows[0].status, 'pending');
+    check(s, 'not flagged as a post-termination rescue', rows[0].review, null);
+    check(s, 'early_out raised on the shift day', await requestsFor(e.id), [
+        { type: 'early_out', date: '2026-09-10', status: 'pending' }
+    ]);
+    check(s, 'pinned to the shift it opened under', await shiftIdsFor(e.id), [SHIFT_LATE]);
+}
+
+/**
+ * A night session whose assignment is rewritten while it is still open. The 16:00-02:00 shift
+ * is replaced mid-session by a 06:00-16:00 one, so date-based resolution reads the 01:55 exit
+ * as arriving eight hours after termination and closes the row with a review flag. Pinned, it
+ * is simply an on-time night exit - and the row must still sit on the day the shift STARTED.
+ */
+async function scenarioNightSessionReassignedMidShift() {
+    const s = 'night session reassigned mid-shift';
+    const e = await makeEmployee(SHIFT_NIGHT);
+    await punch(e.code, '2026-09-10 16:05:00');
+    await reassign(e.id, SHIFT_DAY, '2026-09-10');
+    await punch(e.code, '2026-09-11 01:55:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'single row', rows.length, 1);
+    check(s, 'closed across midnight', rows[0].out, '2026-09-11 01:55:00');
+    check(s, 'on time against the night shift, not a termination rescue', rows[0].status, 'present');
+    check(s, 'nothing to review', rows[0].review, null);
+    check(s, 'logical day is still the start day', String((await db('attendance').where({ employee_id: e.id }).first()).logical_date).slice(0, 10), '2026-09-10');
+    check(s, 'pinned to the night shift', await shiftIdsFor(e.id), [SHIFT_NIGHT]);
+}
+
+/**
+ * The before-shift-start guard must STILL fire for the case it was written for: a punch that
+ * really does land before the shift start with no open row to close. The day here is already
+ * settled (06:00-15:57) and the roster has since moved to a 16:00 shift, so the stray 15:59 tap
+ * reads as "before shift start" - and with nothing open, discarding it is correct. Recording it
+ * would rewrite a finished day's checkout.
+ */
+async function scenarioBeforeShiftStartWithNoOpenRow() {
+    const s = 'before shift start with no open row';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    await punch(e.code, '2026-09-10 15:57:00');
+    await reassign(e.id, SHIFT_NIGHT, '2026-09-10');   // now judged against a 16:00 start
+    const stray = await punch(e.code, '2026-09-10 15:59:00');
+
+    check(s, 'still skipped', stray, { status: 'skipped', reason: 'Punch out prior to shift start' });
+    check(s, 'the settled day is untouched', await rowsFor(e.id), [
+        { in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present', source: 'biometric', review: null }
+    ]);
+    check(s, 'audited as skipped', (await db('biometric_raw_logs')
+        .where({ company_id: CO, employee_code: e.code, punch_time: '2026-09-10 15:59:00' }).first()).status, 'skipped');
+}
+
+/**
+ * Backward compatibility, and the reason the guard was relaxed rather than just fixed upstream.
+ * Every attendance row written before attendance.shift_id existed carries NULL there, so its
+ * session shift has to be re-resolved by date - and if the roster changed since, that
+ * resolution can put the shift start AFTER the employee's real exit. Such a punch used to be
+ * discarded and the row left open forever. It must now close the row and be flagged instead:
+ * a real punch is never silently lost.
+ */
+async function scenarioUnpinnedRowStillClosed() {
+    const s = 'unpinned legacy row is still closed';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    // Exactly what production holds today: a row with no pinned shift.
+    await db('attendance').where({ employee_id: e.id, company_id: CO }).update({ shift_id: null });
+    await reassign(e.id, SHIFT_NIGHT, '2026-09-10');
+    const exit = await punch(e.code, '2026-09-10 15:57:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'the exit is recorded, not skipped', exit.status, 'check-out');
+    check(s, 'the row is closed', rows[0].out, '2026-09-10 15:57:00');
+    check(s, 'and flagged for a human', rows[0].review, 'closed_before_shift_start');
+    // Against the 16:00-02:00 shift it is now judged by, 15:57 is a very early exit, so the
+    // normal early-out path runs. That is the honest reading of an unpinnable row.
+    check(s, 'early against the resolved shift', rows[0].status, 'pending');
+    check(s, 'early_out raised', await requestsFor(e.id), [
+        { type: 'early_out', date: '2026-09-10', status: 'pending' }
+    ]);
+}
+
+/**
+ * Split (4-punch) shifts write TWO rows for one logical day by design, and a roster edit
+ * between the sessions must not collapse that. Session 1 is already settled when the
+ * reassignment lands, so it must stay exactly as it was and keep pointing at the shift it ran
+ * under; session 2 opens afterwards and belongs to the new shift. Each session is
+ * self-describing, which is the whole point of pinning.
+ */
+async function scenarioSplitShiftReassignedBetweenSessions() {
+    const s = 'split shift reassigned between sessions';
+    const e = await makeEmployee(SHIFT_SPLIT);
+    await punch(e.code, '2026-09-10 07:00:00');
+    await punch(e.code, '2026-09-10 12:00:00');
+    await reassign(e.id, SHIFT_SPLIT_LATE, '2026-09-10');   // 09:00-13:00 / 19:00-23:30
+    await punch(e.code, '2026-09-10 19:00:00');
+    await punch(e.code, '2026-09-10 23:25:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'still two rows, one per session', rows.length, 2);
+    check(s, 'session 1 is untouched by the reassignment', rows[0], {
+        in: '2026-09-10 07:00:00', out: '2026-09-10 12:00:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'session 2 runs on the new shift', rows[1], {
+        in: '2026-09-10 19:00:00', out: '2026-09-10 23:25:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'each row remembers its own shift', await shiftIdsFor(e.id), [SHIFT_SPLIT, SHIFT_SPLIT_LATE]);
+}
+
+/**
+ * Overlapping open-ended assignments must resolve by from_date, not by insertion order.
+ *
+ * ATTENDANCE_TROUBLESHOOTING.md records this as the "Shift Assignment Priority Bug": an
+ * employee accumulates several assignments with no to_date, and ordering them by id means the
+ * shift that wins is whichever row was inserted last rather than the rotation that started most
+ * recently. 164 of 231 active employees at one client were in that state (measured 2026-09-05),
+ * and attendanceService already orders by from_date - so an ingestion path that did not was
+ * judging days by a different shift than the muster displayed them under.
+ *
+ * The fixture inserts the STALE assignment second so it carries the higher id: id order picks
+ * the 16:00-02:00 night shift and throws the 06:00 arrival away as "before allowed margin",
+ * from_date order picks the 06:00-16:00 rotation that actually started this month.
+ */
+async function scenarioOverlappingAssignmentsResolveByFromDate() {
+    const s = 'overlapping assignments resolve by from_date';
+    const e = await makeEmployee(SHIFT_DAY, { assign: false });
+    await db('employee_shift_assignments').insert({
+        company_id: CO, employee_id: e.id, shift_id: SHIFT_DAY, from_date: '2026-09-01', to_date: null
+    });
+    await db('employee_shift_assignments').insert({   // older rotation, higher id
+        company_id: CO, employee_id: e.id, shift_id: SHIFT_NIGHT, from_date: '2026-01-01', to_date: null
+    });
+
+    await punch(e.code, '2026-09-10 06:00:00');
+    await punch(e.code, '2026-09-10 15:57:00');
+
+    check(s, 'the newest rotation wins, so the day is clean', await rowsFor(e.id), [
+        { in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present', source: 'biometric', review: null }
+    ]);
+    check(s, 'and it is the shift pinned to the row', await shiftIdsFor(e.id), [SHIFT_DAY]);
+}
+
 const SCENARIOS = [
     scenarioLateTerminationCheckout,
     scenarioStaleRowNotAbsorbed,
@@ -496,7 +718,14 @@ const SCENARIOS = [
     scenarioFlexiHalfDay,
     scenarioNoAssignmentFallback,
     scenarioUnmappedCode,
-    scenarioSplitShift
+    scenarioSplitShift,
+    scenarioMidSessionReassignLaterShift,
+    scenarioMidSessionReassignEarlierShift,
+    scenarioNightSessionReassignedMidShift,
+    scenarioBeforeShiftStartWithNoOpenRow,
+    scenarioUnpinnedRowStillClosed,
+    scenarioSplitShiftReassignedBetweenSessions,
+    scenarioOverlappingAssignmentsResolveByFromDate
 ];
 
 async function main() {
