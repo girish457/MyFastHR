@@ -93,6 +93,132 @@ function primaryDayLog(dayLogs, resolvedShift = null) {
     return dayLogs.find(a => a.check_out) || dayLogs[0];
 }
 
+// The one ordering every employee_shift_assignments lookup must use.
+//
+// ATTENDANCE_TROUBLESHOOTING.md records `from_date DESC, id DESC` as the fix for the shift
+// assignment priority bug: an assignment must resolve by the period it COVERS first and only
+// then by insertion order. `id desc` alone picks the most recently CREATED row, which is a
+// different row whenever an employee holds overlapping open-ended assignments - 164 of 231
+// active employees at one client. Screens that ordered differently resolved different shifts
+// for the same day: measured on one 09:00-18:00 row, the muster said E / QA Evening while the
+// day-detail drawer and the history sheet said L / QA Morning.
+function byEffectiveAssignment(query) {
+    return query.orderBy('esa.from_date', 'desc').orderBy('esa.id', 'desc');
+}
+
+// Load the `shifts` rows a set of attendance rows is PINNED to, keyed by id.
+// Returns {} when nothing is pinned, so pre-existing rows cost no query.
+async function loadPinnedShifts(attendanceRows, conn = db) {
+    const ids = [...new Set((attendanceRows || []).map(r => r && r.shift_id).filter(Boolean))];
+    if (ids.length === 0) return {};
+    const rows = await conn('shifts').whereIn('id', ids);
+    const byId = {};
+    rows.forEach(s => { byId[s.id] = s; });
+    return byId;
+}
+
+// The shift a DAY was recorded under, or null.
+//
+// attendance.shift_id is stamped at check-in by the ingestion engine (89b9968) and is the only
+// record of which shift a session was actually judged against. employee_shift_assignments is
+// editable at any moment, including retroactively over days already worked, so re-resolving a
+// settled day from the roster is how a correct `09:00->18:00 present` row starts rendering Late
+// days later - or Half Day, which silently halves that day's pay - after an ordinary rotation
+// entry. Every pre-existing production row has shift_id NULL and still falls back to the
+// date-based roster lookup, which is exactly today's behaviour.
+function pinnedShiftForDay(dayLogs, shiftsById) {
+    if (!dayLogs || !shiftsById) return null;
+    for (const log of dayLogs) {
+        if (log && log.shift_id && shiftsById[log.shift_id]) return shiftsById[log.shift_id];
+    }
+    return null;
+}
+
+// What the day must be judged by: its own pin, else the roster assignment covering the date,
+// else the employee's profile shift.
+function shiftForDay(dayLogs, shiftsById, rosterAssignment, fallbackShift = null) {
+    return pinnedShiftForDay(dayLogs, shiftsById) || rosterAssignment || fallbackShift || null;
+}
+
+// The single place where a worked day becomes a status letter.
+//
+// The muster recomputed this inline, the history sheet trusted attendance.status untouched, and
+// the day-detail drawer recomputed it a third way through calculateSplitShiftStatus - so the
+// same row read L on the muster, P on history and E in the drawer. Three screens over one
+// database row must not be able to disagree, so they all call this now.
+//
+// `resolvedShift` must already be the shift the day was RECORDED under (see shiftForDay), not
+// whatever the roster says today. Returns null when the day has no attendance at all, which is
+// the caller's cue to fall through to weekoff / holiday / leave / absent.
+function resolveDayStatus(dayLogs, resolvedShift, rules, ctx = {}) {
+    const { regularization = false, earlyOutRequest = false } = ctx;
+
+    if (!dayLogs || dayLogs.length === 0) {
+        if (regularization) return 'R';
+        if (earlyOutRequest) return 'E';
+        return null;
+    }
+
+    const shift = resolvedShift || {};
+    const firstLog = primaryDayLog(dayLogs, shift);
+    const dbStatus = firstLog.status ? String(firstLog.status).toLowerCase() : '';
+
+    const logCheckInDate = dbDateToUTC(firstLog.check_in);
+    const logCheckInYMD = logCheckInDate ? logCheckInDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' }) : null;
+    const curTodayYMD = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+    const isTodayActive = (logCheckInYMD === curTodayYMD);
+
+    if (dbStatus === 'pending') {
+        if (firstLog.check_out) return calculateSplitShiftStatus(dayLogs, shift, rules).status;
+        return isTodayActive ? 'CI' : 'A';
+    }
+
+    if (!firstLog.check_out && isTodayActive &&
+        firstLog.punch_source !== 'manual' &&
+        firstLog.punch_source !== 'manual_override' &&
+        firstLog.punch_source !== 'regularization' &&
+        dbStatus !== 'regularized' && dbStatus !== 'r' && !regularization) {
+        return 'CI';
+    }
+
+    if (firstLog.punch_source === 'manual' || firstLog.punch_source === 'manual_override') {
+        return mapDbStatusToFrontend(dbStatus);
+    }
+
+    if (regularization || dbStatus === 'regularized' || dbStatus === 'r' || firstLog.punch_source === 'regularization') {
+        return 'R';
+    }
+
+    // A settled decision an approver made. The row's own status is the answer; recomputing it
+    // from the clock is how an approved late_in still drew E in the day-detail drawer.
+    if (firstLog.punch_source === 'entry_request' || earlyOutRequest) {
+        if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd') return 'HD';
+        if (dbStatus === 'late-in' || dbStatus === 'late_in' || dbStatus === 'late' || dbStatus === 'l') return 'L';
+        if (dbStatus === 'present' || dbStatus === 'p') return 'P';
+        if (dbStatus === 'absent' || dbStatus === 'a') return 'A';
+        return 'E';
+    }
+
+    if (dbStatus === 'absent' || dbStatus === 'a') return 'A';
+    if (dbStatus === 'off') return 'OFF';
+    if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd' || dbStatus === 'short') return 'HD';
+    if (dbStatus === 'early-out' || dbStatus === 'early_out' || dbStatus === 'eo' || dbStatus === 'e') return 'E';
+    if (shift.is_flexi) return 'P';
+
+    return calculateSplitShiftStatus(dayLogs, shift, rules).status;
+}
+
+// The stats increments the muster used to copy-paste five times, each copy covering a slightly
+// different subset of the statuses it could actually be handed.
+function bumpDayStats(stats, status) {
+    if (status === 'P' || status === 'R' || status === 'E') stats.P++;
+    else if (status === 'HD') stats.P += 0.5;
+    else if (status === 'L') stats.L++;
+    else if (status === 'A') stats.A++;
+    else if (status === 'OFF') stats.OFF++;
+    else if (status === 'H') stats.H++;
+}
+
 function checkIfLogUsedGrace(log, employee, rules) {
     if (!log.check_in) return false;
     const logCheckIn = dbDateToUTC(log.check_in);
@@ -131,7 +257,7 @@ async function isNightShiftForEmployeeDate(employeeId, dateStr, companyId) {
             qb.where('esa.to_date', '>=', dateStr).orWhereNull('esa.to_date');
         })
         .select('s.*')
-        .orderBy('esa.id', 'desc')
+        .modify(byEffectiveAssignment)
         .first();
     
     const shift = activeAssignment || await db('employees as e')
@@ -262,6 +388,40 @@ function mapFrontendStatusToDb(status) {
 
 function calculateSplitShiftStatus(dayLogs, shift, rules) {
     const reqPunches = parseInt(shift.total_punches_required || shift.shift_total_punches || 2);
+
+    // A flexi shift has no clock to be late or early against - min_hours is the entire rule, and
+    // the ingestion engine already applied it when it wrote the row (570b2d6). Judging one by
+    // start_time/end_time is why every flexi employee's day-detail panel read "Late": the shift is
+    // stored as 00:00-23:59 with grace 0, so any arrival after midnight is late. The muster
+    // short-circuits flexi before it ever gets here, which is exactly how the two screens came to
+    // contradict each other on a clean flexi day with no reassignment at all.
+    const isFlexi = !!(shift.is_flexi === 1 || shift.is_flexi === true ||
+                       shift.shift_is_flexi === 1 || shift.shift_is_flexi === true);
+    if (isFlexi) {
+        const log = dayLogs && dayLogs[0];
+        if (!log) return { status: 'A', explanation: 'Flexi: Missed', punch_count: 0 };
+
+        const punchCount = dayLogs.reduce((acc, l) => acc + (l.check_in ? 1 : 0) + (l.check_out ? 1 : 0), 0);
+        const closed = dayLogs.filter(l => l.check_in && l.check_out);
+        if (closed.length === 0) {
+            const isToday = toLocalYMD(log.check_in) === toLocalYMD(new Date());
+            return {
+                status: isToday ? 'CI' : 'A',
+                explanation: `Flexi: No Out (${safeFormatTime(log.check_in)} - --:--)`,
+                punch_count: punchCount
+            };
+        }
+
+        const workedH = closed.reduce(
+            (acc, l) => acc + (dbDateToUTC(l.check_out) - dbDateToUTC(l.check_in)), 0
+        ) / 3600000;
+        const minHours = parseFloat(shift.min_hours ?? shift.shift_min_hours ?? 0) || 0;
+        return {
+            status: 'P',
+            explanation: `Flexi: ${workedH.toFixed(1)}h worked${minHours ? ` of ${minHours}h required` : ''} (${safeFormatTime(log.check_in)} - ${safeFormatTime(closed[closed.length - 1].check_out)})`,
+            punch_count: punchCount
+        };
+    }
 
     const timeToMins = (timeStr) => {
         if (!timeStr) return 0;
@@ -535,7 +695,7 @@ class AttendanceService {
                         qb.where('esa.to_date', '>=', prevDateStr).orWhereNull('esa.to_date');
                     })
                     .select('s.*')
-                    .orderBy('esa.id', 'desc')
+                    .modify(byEffectiveAssignment)
                     .first();
                 
                 if (activeAssignment) {
@@ -594,7 +754,7 @@ class AttendanceService {
                     's.session2_grace_out',
                     's.terminate_hour'
                 )
-                .orderBy('esa.id', 'desc')
+                .modify(byEffectiveAssignment)
                 .first();
  
             if (activeAssignment) {
@@ -631,7 +791,7 @@ class AttendanceService {
             .join('shifts as s', 'esa.shift_id', 's.id')
             .where('esa.employee_id', empId)
             .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time')
-            .orderBy('esa.id', 'desc');
+            .modify(byEffectiveAssignment);
 
         const nextDate = new Date(new Date(dateStr).getTime() + 24 * 60 * 60 * 1000);
         const nextDateStr = nextDate.toISOString().split('T')[0];
@@ -768,7 +928,10 @@ class AttendanceService {
                               qb2.where('esa.to_date', '>=', startOfMonth).orWhereNull('esa.to_date');
                           });
                     })
-                    .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time', 's.grace_period', 's.is_night_shift');
+                    .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time', 's.grace_period', 's.is_night_shift')
+                    // Read with .find() below, so it needs the same ordering as every other
+                    // assignment lookup - it had none at all, which left the winner up to MySQL.
+                    .modify(byEffectiveAssignment);
 
                 let graceCount = 0;
                 for (const log of currentMonthLogs) {
@@ -902,7 +1065,7 @@ class AttendanceService {
                     's.session2_grace_out',
                     's.terminate_hour'
                 )
-                .orderBy('esa.id', 'desc')
+                .modify(byEffectiveAssignment)
                 .first();
 
             if (activeAssignment) {
@@ -1176,6 +1339,10 @@ class AttendanceService {
         const raw = await attendanceRepository.getCompanyMatrix(user, month, year);
         const daysInMonth = new Date(year, month, 0).getDate();
 
+        // The shifts these rows were actually recorded under. Keyed by id, so a day is judged by
+        // its own pin instead of by whatever the roster resolves to at render time.
+        const pinnedShifts = await loadPinnedShifts(raw.attendance);
+
         const employeeIds = raw.employees.map(e => e.id);
         const shiftAssignments = employeeIds.length > 0 ? await db('employee_shift_assignments as esa')
             .join('shifts as s', 'esa.shift_id', 's.id')
@@ -1191,6 +1358,7 @@ class AttendanceService {
                 'esa.employee_id',
                 'esa.from_date',
                 'esa.to_date',
+                's.name',
                 's.is_flexi',
                 's.min_hours',
                 's.start_time',
@@ -1210,13 +1378,7 @@ class AttendanceService {
                 's.terminate_hour',
                 'esa.id'
             )
-            // from_date first, then id - the ordering ATTENDANCE_TROUBLESHOOTING.md records as
-            // the fix for the shift-resolution bug, and the one manualUpdateAttendance already
-            // uses. Ordering by id alone makes the newest ROW win rather than the newest
-            // EFFECTIVE assignment, so the muster could resolve a different shift than the edit
-            // screen for the same day whenever an employee has overlapping assignments.
-            .orderBy('esa.from_date', 'desc')
-            .orderBy('esa.id', 'desc') : [];
+            .modify(byEffectiveAssignment) : [];
 
         const formatDbDate = (val) => {
             if (!val) return null;
@@ -1353,10 +1515,23 @@ class AttendanceService {
                 const targetDateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
                 const dateTime = date.getTime();
 
+                // 1. Check Attendance (Includes Manual Overrides, Biometric, Regularization, Entry/Exit Requests)
+                // Read BEFORE the shift is resolved: the day's own rows say which shift it was
+                // recorded under, and that outranks the roster.
+                const dayLogs = (attendanceMap[emp.id] && attendanceMap[emp.id][d]) || [];
+
+                const dayRegularization = regularizationsMap[emp.id]?.[d];
+                const dayEarlyOut = entryRequestsMap[emp.id]?.[d];
+
                 // Resolve active shift for this employee on targetDateStr
-                const activeAssignment = empAssignments.find(sa =>
+                const rosterAssignment = empAssignments.find(sa =>
                     sa.fromStr <= targetDateStr && (!sa.toStr || sa.toStr >= targetDateStr)
                 );
+                // A settled day is judged by the shift it was worked under, not by the shift the
+                // roster happens to name now. Without this, moving an employee from a 09:00-18:00
+                // shift to a 4-punch split - the ordinary "enter the rotation a few days late"
+                // flow - turned a finished on-time day into HD and halved that day's pay.
+                const activeAssignment = shiftForDay(dayLogs, pinnedShifts, rosterAssignment);
 
                 const resolvedShift = {
                     ...emp,
@@ -1393,105 +1568,13 @@ class AttendanceService {
 
                 let status = '-'; // Default unknown
 
-                // 1. Check Attendance (Includes Manual Overrides, Biometric, Regularization, Entry/Exit Requests)
-                const dayLogs = (attendanceMap[emp.id] && attendanceMap[emp.id][d]) || [];
-
-                const dayRegularization = regularizationsMap[emp.id]?.[d];
-                const dayEarlyOut = entryRequestsMap[emp.id]?.[d];
-
-                if (dayLogs.length > 0) {
-                    const firstLog = primaryDayLog(dayLogs, resolvedShift);
-                    const dbStatus = firstLog.status ? firstLog.status.toLowerCase() : '';
-
-                    const logCheckInDate = dbDateToUTC(firstLog.check_in);
-                    const logCheckInYMD = logCheckInDate ? logCheckInDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' }) : null;
-                    const curTodayYMD = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
-                    const isTodayActive = (logCheckInYMD === curTodayYMD);
-
-                    if (dbStatus === 'pending') {
-                        if (firstLog.check_out) {
-                            const calc = calculateSplitShiftStatus(dayLogs, resolvedShift, rules);
-                            status = calc.status;
-                            if (status === 'P') stats.P++;
-                            else if (status === 'HD') stats.P += 0.5;
-                            else if (status === 'L') stats.L++;
-                            else if (status === 'E') stats.P++;
-                            else if (status === 'A') stats.A++;
-                        } else if (isTodayActive) {
-                            status = 'CI';
-                        } else {
-                            status = 'A';
-                            stats.A++;
-                        }
-                    } else if (!firstLog.check_out && isTodayActive && 
-                               firstLog.punch_source !== 'manual' && 
-                               firstLog.punch_source !== 'manual_override' && 
-                               firstLog.punch_source !== 'regularization' && 
-                               dbStatus !== 'regularized' && dbStatus !== 'r' && !dayRegularization) {
-                        status = 'CI';
-                    } else if (firstLog.punch_source === 'manual' || firstLog.punch_source === 'manual_override') {
-                        status = mapDbStatusToFrontend(dbStatus);
-                        if (status === 'P' || status === 'R') stats.P++;
-                        else if (status === 'HD') stats.P += 0.5;
-                        else if (status === 'L') stats.L++;
-                        else if (status === 'E') stats.P++;
-                        else if (status === 'A') stats.A++;
-                        else if (status === 'OFF') stats.OFF++;
-                        else if (status === 'H') stats.H++;
-                    } else if (dayRegularization || dbStatus === 'regularized' || dbStatus === 'r' || firstLog.punch_source === 'regularization') {
-                        status = 'R';
-                        stats.P++;
-                    } else if (firstLog.punch_source === 'entry_request' || dayEarlyOut) {
-                        if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd') {
-                            status = 'HD';
-                            stats.P += 0.5;
-                        } else if (dbStatus === 'late-in' || dbStatus === 'late_in' || dbStatus === 'late' || dbStatus === 'l') {
-                            status = 'L';
-                            stats.L++;
-                        } else if (dbStatus === 'present' || dbStatus === 'p') {
-                            status = 'P';
-                            stats.P++;
-                        } else if (dbStatus === 'absent' || dbStatus === 'a') {
-                            status = 'A';
-                            stats.A++;
-                        } else if (dbStatus === 'early-out' || dbStatus === 'early_out' || dbStatus === 'eo' || dbStatus === 'e') {
-                            status = 'E';
-                            stats.P++;
-                        } else {
-                            status = 'E';
-                            stats.P++;
-                        }
-                    } else if (dbStatus === 'absent' || dbStatus === 'a') {
-                        status = 'A';
-                        stats.A++;
-                    } else if (dbStatus === 'off') {
-                        status = 'OFF';
-                        stats.OFF++;
-                    } else if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd' || dbStatus === 'short') {
-                        status = 'HD';
-                        stats.P += 0.5;
-                    } else if (dbStatus === 'early-out' || dbStatus === 'early_out' || dbStatus === 'eo' || dbStatus === 'e') {
-                        status = 'E';
-                        stats.P++;
-                    } else if (resolvedShift.is_flexi) {
-                        status = 'P';
-                        stats.P++;
-                    } else {
-                        // Compute status using split-shift helper
-                        const calc = calculateSplitShiftStatus(dayLogs, resolvedShift, rules);
-                        status = calc.status;
-                        if (status === 'P') stats.P++;
-                        else if (status === 'HD') stats.P += 0.5;
-                        else if (status === 'L') stats.L++;
-                        else if (status === 'E') stats.P++; // Early out still counts as present/hours completed
-                        else if (status === 'A') stats.A++;
-                    }
-                } else if (dayRegularization) {
-                    status = 'R';
-                    stats.P++;
-                } else if (dayEarlyOut) {
-                    status = 'E';
-                    stats.P++;
+                if (dayLogs.length > 0 || dayRegularization || dayEarlyOut) {
+                    // Shared with the history sheet and the day-detail drawer - see resolveDayStatus.
+                    status = resolveDayStatus(dayLogs, resolvedShift, rules, {
+                        regularization: !!dayRegularization,
+                        earlyOutRequest: !!dayEarlyOut
+                    });
+                    bumpDayStats(stats, status);
                 } else {
                     // 2. Check Week-offs
                     if (empWeekoffs.includes(dayName)) {
@@ -1605,7 +1688,12 @@ class AttendanceService {
                 grid_timings[d] = { in1, out1, in2, out2 };
                 grid_meta[d] = {
                     is_override: dayLogs.some(a => a.punch_source === 'manual' || a.punch_source === 'manual_override'),
-                    is_grace: isGrace && status !== 'L' && status !== 'A' && status !== '-'
+                    is_grace: isGrace && status !== 'L' && status !== 'A' && status !== '-',
+                    // The row header can only carry ONE shift name (employees.shift_id, the
+                    // profile default), so every day of the month is labelled with the shift the
+                    // employee holds today - which is what makes a wrong-looking cell read as
+                    // plausible to an admin. This is the shift the day was actually judged by.
+                    shift_name: activeAssignment?.name || emp.shift_name || null
                 };
             }
 
@@ -1645,7 +1733,7 @@ class AttendanceService {
             .join('shifts as s', 'esa.shift_id', 's.id')
             .where('esa.employee_id', employee_id)
             .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time')
-            .orderBy('esa.id', 'desc');
+            .modify(byEffectiveAssignment);
 
         const nextDate = new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000);
         const nextDateStr = nextDate.toISOString().split('T')[0];
@@ -1771,7 +1859,7 @@ class AttendanceService {
                 this.where('esa.to_date', '>=', formattedDate).orWhereNull('esa.to_date');
             })
             .select('esa.employee_id', 's.start_time', 's.grace_period', 's.name', 's.is_flexi')
-            .orderBy('esa.id', 'desc');
+            .modify(byEffectiveAssignment);
 
         // 5. Categorize
         const onTime = [];
@@ -1989,7 +2077,7 @@ class AttendanceService {
             .join('shifts as s', 'esa.shift_id', 's.id')
             .where({ 'esa.employee_id': employeeId })
             .select('s.*', 'esa.from_date', 'esa.to_date')
-            .orderBy('esa.id', 'desc');
+            .modify(byEffectiveAssignment);
 
         const employee = await db('employees as e')
             .leftJoin('shifts as s', 'e.shift_id', 's.id')
@@ -1997,6 +2085,23 @@ class AttendanceService {
             .select('s.*', 's.name as default_shift_name')
             .first();
         const defaultShiftName = employee?.default_shift_name || '---';
+
+        const pinnedShifts = await loadPinnedShifts(attendance);
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || {};
+
+        // The muster treats an approved early-out request / regularization as the day's answer even
+        // when no attendance row carries it. This sheet has to see the same two facts or it will
+        // still disagree with the grid on exactly those days.
+        const approvedEarlyOuts = await db('attendance_entry_requests')
+            .where({ employee_id: employeeId, company_id: companyId, request_type: 'early_out', status: 'approved' })
+            .whereBetween('date', [from, to])
+            .select('date');
+        const approvedRegularizations = await db('attendance_regularizations')
+            .where({ employee_id: employeeId, company_id: companyId, status: 'approved' })
+            .whereBetween('date', [from, to])
+            .select('date');
+        const earlyOutDays = new Set(approvedEarlyOuts.map(r => toLocalYMD(r.date)));
+        const regularizedDays = new Set(approvedRegularizations.map(r => toLocalYMD(r.date)));
 
         // Map into a daily sheet
         const start = new Date(from);
@@ -2009,39 +2114,25 @@ class AttendanceService {
                 const logLogicalDate = rowLogicalDate(a, shifts, employee);
                 return logLogicalDate === dateStr;
             });
-            const shift = shifts.find(s => {
+            const rosterShift = shifts.find(s => {
                 const fromStr = toLocalYMD(s.from_date);
                 const toStr = toLocalYMD(s.to_date);
                 return dateStr >= fromStr && (!toStr || dateStr <= toStr);
             });
-            // Same duplicate-row hazard as the muster grid; this sheet must agree with it or
-            // the two screens contradict each other for the same day.
-            const record = primaryDayLog(dayLogs, shift || employee); // fallback/primary status record
+            // The shift the day was recorded under outranks the roster - the same rule the muster
+            // applies, and the reason this sheet no longer contradicts it after a rotation entry.
+            const shift = shiftForDay(dayLogs, pinnedShifts, rosterShift, employee);
 
             const s1Ms = dayLogs[0] && dayLogs[0].check_out ? (new Date(dayLogs[0].check_out) - new Date(dayLogs[0].check_in)) : 0;
             const s2Ms = dayLogs[1] && dayLogs[1].check_out ? (new Date(dayLogs[1].check_out) - new Date(dayLogs[1].check_in)) : 0;
 
-            let historyStatus = 'A';
-            if (record) {
-                if (record.status === 'pending') {
-                    if (record.check_out) {
-                        const resolvedShift = shift || employee || { start_time: '09:00', end_time: '18:00' };
-                        const calc = calculateSplitShiftStatus(dayLogs, resolvedShift);
-                        historyStatus = calc.status;
-                    } else {
-                        const checkInDate = dbDateToUTC(record.check_in);
-                        const checkInYMD = checkInDate ? checkInDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' }) : null;
-                        const todayYMD = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
-                        if (checkInYMD === todayYMD) {
-                            historyStatus = 'CI';
-                        } else {
-                            historyStatus = 'A';
-                        }
-                    }
-                } else {
-                    historyStatus = mapDbStatusToFrontend(record.status || 'present');
-                }
-            }
+            // This sheet used to read attendance.status straight out of the row while the muster
+            // recomputed the same day, so a day could read P here and L/HD/E on the admin grid.
+            // Both now go through resolveDayStatus.
+            const historyStatus = resolveDayStatus(dayLogs, shift, rules, {
+                regularization: regularizedDays.has(dateStr),
+                earlyOutRequest: earlyOutDays.has(dateStr)
+            }) || 'A';
 
             sheet.push({
                 date: dateStr,
@@ -2071,7 +2162,8 @@ class AttendanceService {
                 'departments.name as department_name'
             );
 
-        // Fetch shift assignments active on this specific date (order by ID descending to respect latest override)
+        // Fetch shift assignments active on this specific date. `s.*` rather than four columns:
+        // this row is handed to the shared status resolver, which needs the whole shift.
         const assignments = await db('employee_shift_assignments as esa')
             .join('shifts as s', 'esa.shift_id', 's.id')
             .where('esa.company_id', companyId)
@@ -2079,10 +2171,12 @@ class AttendanceService {
             .andWhere(function () {
                 this.where('esa.to_date', '>=', date).orWhereNull('esa.to_date');
             })
-            .select('esa.employee_id', 's.start_time', 's.end_time', 's.grace_period', 's.name as shift_name')
-            .orderBy('esa.id', 'desc');
+            .select('esa.employee_id', 's.*', 's.name as shift_name')
+            .modify(byEffectiveAssignment);
 
         const shifts = await db('shifts').where({ company_id: companyId });
+
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || {};
 
         const nextDate = new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
         const attendance = await db('attendance')
@@ -2092,8 +2186,10 @@ class AttendanceService {
                   .orWhereRaw('DATE(check_in) = ?', [nextDate]);
             });
 
+        const pinnedShifts = await loadPinnedShifts(attendance);
+
         return employees.map(emp => {
-            const activeAssignment = assignments.find(a => a.employee_id === emp.id);
+            const rosterAssignment = assignments.find(a => a.employee_id === emp.id);
             const defaultShift = shifts.find(s => s.id === emp.shift_id);
 
             const empLogs = attendance.filter(a => {
@@ -2111,9 +2207,10 @@ class AttendanceService {
                 const logLogicalDate = rowLogicalDate(a, formattedAssignments, defaultShift);
                 return logLogicalDate === date;
             });
-            // Same duplicate-row hazard as the muster grid; see primaryDayLog.
-            const record = primaryDayLog(empLogs, activeAssignment || defaultShift);
-            const shiftName = activeAssignment?.shift_name || defaultShift?.name || '---';
+            // The shift the day was recorded under outranks the roster, so this screen labels and
+            // judges the day the same way the muster does after a rotation entry.
+            const activeShift = shiftForDay(empLogs, pinnedShifts, rosterAssignment, defaultShift);
+            const shiftName = activeShift?.shift_name || activeShift?.name || '---';
 
             const s1Ms = empLogs[0] && empLogs[0].check_out ? (new Date(empLogs[0].check_out) - new Date(empLogs[0].check_in)) : 0;
             const s2Ms = empLogs[1] && empLogs[1].check_out ? (new Date(empLogs[1].check_out) - new Date(empLogs[1].check_in)) : 0;
@@ -2128,7 +2225,7 @@ class AttendanceService {
                 department_name: emp.department_name,
                 shift_name: shiftName,
                 shift_code: shiftName,
-                status: mapDbStatusToFrontend(record ? (record.status || 'present') : 'A'),
+                status: resolveDayStatus(empLogs, activeShift, rules) || 'A',
                 first_in: empLogs[0] ? safeFormatTime(empLogs[0].check_in) : null,
                 last_out: empLogs[empLogs.length - 1] ? safeFormatTime(empLogs[empLogs.length - 1].check_out) : null,
                 session1: s1Ms > 0 ? `${(s1Ms / 3600000).toFixed(1)}h` : '0.0h',
@@ -2152,11 +2249,7 @@ class AttendanceService {
                 .join('shifts as s', 'esa.shift_id', 's.id')
                 .where('esa.employee_id', employee_id)
                 .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time')
-                // from_date desc first: assignments must resolve by the period they
-                // cover, and only then by insertion order. id desc alone picks the
-                // most recently created row (the Ritesh Patel bug).
-                .orderBy('esa.from_date', 'desc')
-                .orderBy('esa.id', 'desc');
+                .modify(byEffectiveAssignment);
 
             const nextDate = new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000);
             const nextDateStr = nextDate.toISOString().split('T')[0];
@@ -2620,7 +2713,7 @@ class AttendanceService {
         }
 
         const assignmentList = await qb.select('esa.id', 'esa.employee_id', 'esa.from_date', 'esa.to_date', 's.name')
-            .orderBy('esa.id', 'desc');
+            .modify(byEffectiveAssignment);
 
 
         // 3. Build Roster Matrix
@@ -2762,6 +2855,8 @@ class AttendanceService {
                 's.session2_in_margin as default_shift_session2_in_margin',
                 's.session2_out_margin as default_shift_session2_out_margin',
                 's.terminate_hour as default_shift_terminate_hour',
+                's.is_flexi as default_shift_is_flexi',
+                's.min_hours as default_shift_min_hours',
                 'asch.weekoffs as scheme_weekoffs'
             )
             .first();
@@ -2808,7 +2903,7 @@ class AttendanceService {
             .join('shifts as s', 'esa.shift_id', 's.id')
             .where('esa.employee_id', employeeId)
             .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time')
-            .orderBy('esa.id', 'desc');
+            .modify(byEffectiveAssignment);
 
         const candidateLogs = await db('attendance')
             .where({ employee_id: employeeId, company_id: companyId })
@@ -2878,8 +2973,11 @@ class AttendanceService {
             .orderBy('id', 'desc')
             .first();
 
-        // 9. Fetch Active Shift for the date
-        const assignments = await db('employee_shift_assignments as esa')
+        // 9. Fetch Active Shift for the date.
+        // is_flexi and min_hours were never projected here, so a flexi shift arrived as a plain
+        // 00:00-23:59 shift with grace 0 and every flexi employee's day read "Late" - on a clean
+        // day, with no reassignment involved at all.
+        const rosterShift = await db('employee_shift_assignments as esa')
             .join('shifts as s', 'esa.shift_id', 's.id')
             .where('esa.employee_id', employeeId)
             .where('esa.from_date', '<=', dateStr)
@@ -2891,10 +2989,15 @@ class AttendanceService {
                 's.session2_start_time', 's.session2_end_time', 's.grace_period',
                 's.session1_grace_out', 's.session2_grace_in', 's.session2_grace_out',
                 's.session1_in_margin', 's.session1_out_margin', 's.session2_in_margin', 's.session2_out_margin',
-                's.terminate_hour'
+                's.terminate_hour', 's.is_flexi', 's.min_hours'
             )
-            .orderBy('esa.id', 'desc')
+            .modify(byEffectiveAssignment)
             .first();
+
+        // The day's own pinned shift outranks the roster, exactly as on the muster - otherwise the
+        // drawer explains a settled day in terms of a shift the employee never worked.
+        const pinnedShifts = await loadPinnedShifts(attendanceLogs);
+        const assignments = shiftForDay(attendanceLogs, pinnedShifts, rosterShift);
 
         const activeShift = assignments || {
             name: emp.default_shift_name || 'General Shift',
@@ -2911,7 +3014,9 @@ class AttendanceService {
             session1_out_margin: emp.default_shift_session1_out_margin || 0,
             session2_in_margin: emp.default_shift_session2_in_margin || 0,
             session2_out_margin: emp.default_shift_session2_out_margin || 0,
-            terminate_hour: emp.default_shift_terminate_hour || null
+            terminate_hour: emp.default_shift_terminate_hour || null,
+            is_flexi: emp.default_shift_is_flexi || 0,
+            min_hours: emp.default_shift_min_hours || null
         };
 
         let attendanceCheckOutText = null;
@@ -2987,12 +3092,11 @@ class AttendanceService {
             };
         });
 
+        // The per-session breakdown this drawer exists to show. Its `status` is overwritten below,
+        // once the approved requests are known, so that the drawer cannot disagree with the grid.
         let splitShiftDetails = null;
         if (attendanceLogs.length > 0) {
             splitShiftDetails = calculateSplitShiftStatus(attendanceLogs, activeShift, rules);
-            if (attendance && (attendance.punch_source === 'manual' || attendance.punch_source === 'manual_override')) {
-                splitShiftDetails.status = mapDbStatusToFrontend(attendance.status);
-            }
         }
 
         // 9b. Fetch all raw biometric logs
@@ -3036,6 +3140,17 @@ class AttendanceService {
                 'approver.first_name as approved_by_first_name', 'approver.last_name as approved_by_last_name'
             )
             .orderBy('r.created_at', 'asc');
+
+        // The drawer used to recompute this cell from the clock and honour the stored status only
+        // for 'manual'/'manual_override' rows. So an approver could approve a late_in or an
+        // early_out, watch the muster settle on L or P, and still find E in the drawer for the same
+        // row. The grid, the history sheet and this drawer all read resolveDayStatus now.
+        if (splitShiftDetails) {
+            splitShiftDetails.status = resolveDayStatus(attendanceLogs, activeShift, rules, {
+                regularization: regularizations.some(r => r.status === 'approved'),
+                earlyOutRequest: entryRequests.some(er => er.request_type === 'early_out' && er.status === 'approved')
+            }) || splitShiftDetails.status;
+        }
 
         return {
             employee: {
@@ -3680,7 +3795,7 @@ class AttendanceService {
                 .join('shifts as s', 'esa.shift_id', 's.id')
                 .where('esa.employee_id', request.employee_id)
                 .select('esa.from_date', 'esa.to_date', 's.start_time', 's.end_time')
-                .orderBy('esa.id', 'desc');
+                .modify(byEffectiveAssignment);
 
             const nextDate = new Date(new Date(dateStr).getTime() + 24 * 60 * 60 * 1000);
             const nextDateStr = nextDate.toISOString().split('T')[0];

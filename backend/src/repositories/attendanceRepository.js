@@ -43,6 +43,9 @@ class AttendanceRepository {
                 qb.where('esa.to_date', '>=', logicalDateStr).orWhereNull('esa.to_date');
             })
             .select('s.start_time', 's.session1_in_margin')
+            // from_date desc, then id desc - ATTENDANCE_TROUBLESHOOTING.md's documented ordering.
+            // id alone picks the most recently created row, not the one that covers this date.
+            .orderBy('esa.from_date', 'desc')
             .orderBy('esa.id', 'desc')
             .first();
         
@@ -216,11 +219,13 @@ class AttendanceRepository {
                       qb2.whereRaw('MONTH(check_in) = ? AND YEAR(check_in) = ? AND DAY(check_in) = 1 AND HOUR(check_in) < 10', [nextM, nextY]);
                   });
             })
-            // logical_date and review_reason are load-bearing for the muster, not extras:
-            // getMatrix prefers the row's persisted logical_date over re-deriving the day
-            // from check_in, and silently falls back to derivation when the column is not
-            // projected here - so omitting them would leave the fix inert with no error.
-            .select('id', 'employee_id', 'check_in', 'check_out', 'status', 'punch_source', 'logical_date', 'review_reason');
+            // logical_date, review_reason and shift_id are load-bearing for the muster, not
+            // extras: getMatrix prefers the row's persisted logical_date over re-deriving the day
+            // from check_in and judges the day by the row's pinned shift_id rather than by
+            // whatever the roster says today, and it silently falls back to the old derivation
+            // when a column is not projected here - so omitting one leaves the fix inert with no
+            // error. This select list has already made one fix inert that way; do not trim it.
+            .select('id', 'employee_id', 'check_in', 'check_out', 'status', 'punch_source', 'logical_date', 'review_reason', 'shift_id');
 
         // 3. Get leaves for these employees
         const leaves = await db('leaves as l')
