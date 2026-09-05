@@ -16,7 +16,23 @@ npm install
 npm run dev      # nodemon src/server.js, http://localhost:5000
 npm start        # node src/server.js (production)
 ```
-There is no backend test suite (`npm test` is a stub) and no lint script.
+There is no general backend test suite (`npm test` is a stub) and no lint script, but the
+punch engine has a regression harness:
+```bash
+npm run punch:replay    # replays ~19 punch scenarios through the real processPunch()
+```
+It refuses to run against any database whose name does not end in `_replay`/`_test`/`_verify`/
+`_scratch`, so set up a scratch DB first (schema-only dump of `myfasthr_db`, then boot the app
+once against it so `syncDatabaseSchema()` adds any new columns) — the header of
+`backend/scripts/replayPunches.js` has the exact commands. **Run it before and after any change
+to `machineAttendanceService.js`, and add a scenario for the bug you are fixing.** Every
+attendance fix before this one was verified with a throwaway script that was then discarded,
+which is why the same bugs kept coming back.
+
+`backend/scripts/` also holds `auditShiftAssignments.js`, a read-only report of employees with
+overlapping or missing shift assignments that prints the repair SQL without running it. Older
+one-off diagnostics still sit loose in `backend/` (`check_*.js`, `test_assignments.js`); new
+tooling belongs in `scripts/`.
 
 **Frontend** (from `frontend/`):
 ```bash

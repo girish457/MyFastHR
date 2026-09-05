@@ -714,6 +714,168 @@ const syncDatabaseSchema = async () => {
             console.error('>>> [DB-SYNC-ERROR]: employees company_id sync failed:', e.message);
         }
 
+        // 12. Ensure attendance table carries logical_date + review_reason
+        // The attendance table pre-exists in every environment (it is older than this
+        // routine), so this block only ever ALTERs — it must never try to create it.
+        //
+        // logical_date is the shift day a row belongs to, stamped at punch-ingestion time.
+        // Today every reader re-derives it from check_in via getLogicalDateStr(), which
+        // resolves the employee's shift at read time and is therefore order-dependent
+        // whenever an employee has overlapping shift assignments — and that is the norm in
+        // this data, not the exception: measured on production 2026-09-05, 164 of 231 active
+        // employees at one client
+        // hold more than one open-ended assignment, so "newest id wins" decides the day.
+        // Persisting the value at write time freezes the grouping the ingestion engine
+        // actually used, and lets a row sit on the correct day even when its check_in is
+        // not, on its own, a reliable indicator of that day (night shifts, rescued punches
+        // that landed in the checkout window, a lone punch after midnight).
+        //
+        // review_reason is set by the ingestion engine when a row was written under an
+        // ambiguous or rescued condition and a human should confirm it before it is treated
+        // as fact. Known values:
+        //   'checkout_window_unpaired'  - a sole punch inside the checkout window that was
+        //                                 rescued as a check-in with no partner punch.
+        //   'early_before_in_margin'    - a punch that arrived before the shift's allowed
+        //                                 early-in margin and was accepted anyway.
+        //   'closed_after_termination'  - the row was auto-closed by termination handling
+        //                                 rather than by a real out-punch.
+        // NULL is the overwhelming majority case and means "nothing to review".
+        //
+        try {
+            const hasAttendanceTable = await db.schema.hasTable('attendance');
+            if (hasAttendanceTable) {
+                const hasLogicalDate = await db.schema.hasColumn('attendance', 'logical_date');
+                if (!hasLogicalDate) {
+                    console.log('>>> [DB-SYNC]: Adding logical_date column to attendance table...');
+                    await db.schema.alterTable('attendance', (table) => {
+                        // Nullable: every row that pre-dates this column has no stamped value,
+                        // and readers must keep falling back to getLogicalDateStr(check_in)
+                        // for those. A backfill is a separate, deliberate operation.
+                        table.date('logical_date').nullable();
+                    });
+                    console.log('>>> [DB-SYNC]: logical_date column added to attendance table.');
+                }
+
+                const hasReviewReason = await db.schema.hasColumn('attendance', 'review_reason');
+                if (!hasReviewReason) {
+                    console.log('>>> [DB-SYNC]: Adding review_reason column to attendance table...');
+                    await db.schema.alterTable('attendance', (table) => {
+                        // varchar(64) is comfortably wider than the longest known value
+                        // ('closed_after_termination', 24 chars), leaving room for future
+                        // reasons without another ALTER. Deliberately a plain string, not an
+                        // enum: the value set is expected to grow as more rescue paths are
+                        // identified, and an enum would turn each addition into a table
+                        // rebuild on every environment.
+                        table.string('review_reason', 64).nullable();
+                    });
+                    console.log('>>> [DB-SYNC]: review_reason column added to attendance table.');
+                }
+
+                // NON-UNIQUE composite index on (employee_id, logical_date).
+                //
+                // Deliberately NOT unique, for two independent reasons — either alone is
+                // disqualifying:
+                //   (a) 4-punch split/session shifts legitimately write TWO attendance rows
+                //       for the same employee on the same logical day (session 1 and
+                //       session 2). A unique index would make the second session's insert
+                //       fail, i.e. it would break a supported shift type by design.
+                //   (b) production held ~920 rows that would violate it (measured 2026-09-05), so the
+                //       CREATE UNIQUE INDEX would simply fail at boot and this whole sync
+                //       block would log-and-skip forever, silently leaving the plain index
+                //       missing too.
+                // Concurrent-insert protection is therefore NOT the index's job: the
+                // ingestion path takes a SELECT ... FOR UPDATE row lock before deciding
+                // whether to insert or update, which is what actually serialises two punches
+                // racing for the same employee/day.
+                //
+                // knex exposes no hasIndex(), so probe information_schema.statistics by name
+                // and only create when absent — re-running CREATE INDEX on an existing name
+                // is a hard error, not a no-op.
+                const [idxRows] = await db.raw(
+                    `SELECT COUNT(*) AS cnt FROM information_schema.statistics
+                     WHERE table_schema = DATABASE()
+                       AND table_name = 'attendance'
+                       AND index_name = 'attendance_emp_logical_date_idx'`
+                );
+                const idxExists = Array.isArray(idxRows) && idxRows.length > 0 && Number(idxRows[0].cnt) > 0;
+                if (!idxExists) {
+                    console.log('>>> [DB-SYNC]: Creating attendance_emp_logical_date_idx on attendance...');
+                    await db.schema.alterTable('attendance', (table) => {
+                        // employee + shift day is the access shape for the muster grid, the
+                        // day-detail drill-down and the ingestion engine's "is there already
+                        // a row for this employee on this day?" lookup.
+                        table.index(['employee_id', 'logical_date'], 'attendance_emp_logical_date_idx');
+                    });
+                    console.log('>>> [DB-SYNC]: attendance_emp_logical_date_idx created.');
+                }
+            }
+        } catch (e) {
+            console.error('>>> [DB-SYNC-ERROR]: attendance logical_date/review_reason sync failed:', e.message);
+        }
+
+        // 13. Ensure attendance_entry_requests table exists
+        // Written by machineAttendanceService (the biometric ingestion path raises the
+        // request), attendanceService.preApproveException (admin pre-approval) and
+        // attendanceService.approveRejectEntryExitRequest, and read by
+        // attendanceService.getEntryExitRequests, the muster day-detail and
+        // attendanceRepository. Despite being on the hot attendance path it had NO block in
+        // this routine until now, which violates the "schema is self-healing here or nowhere"
+        // convention — a fresh environment simply had no such table and every entry-request
+        // write threw.
+        //
+        // Shape verified against production today (SHOW CREATE TABLE), not inferred from
+        // call sites:
+        //   - `date` is the SHIFT day the request belongs to, not the calendar day of
+        //     punch_time. They diverge for night shifts and for punches rescued across
+        //     midnight, and conflating the two is exactly the bug that made an approval land
+        //     on the wrong attendance row.
+        //   - approved_by holds a users.id (the approver's login), NOT an employee id — the
+        //     read path left-joins users on it.
+        //   - status is nullable with a 'pending' default; older rows written before the
+        //     default was in place can carry NULL, so readers must treat NULL as pending.
+        //   - request_type has NO enum and NO CHECK constraint in prod: it is a plain
+        //     varchar(50) validated only by string comparison at the call sites
+        //     ('late_in' | 'early_out' | 'missing_in'). 'missing_in' is a newly added third
+        //     value, which is precisely why the column must stay a free string here — an
+        //     enum would have required a coordinated schema change to ship it.
+        try {
+            const hasEntryRequests = await db.schema.hasTable('attendance_entry_requests');
+            if (!hasEntryRequests) {
+                console.log('>>> [DB-SYNC]: Creating attendance_entry_requests table...');
+                await db.schema.createTable('attendance_entry_requests', (table) => {
+                    table.increments('id').primary();
+                    table.integer('company_id').unsigned().notNullable();
+                    table.integer('employee_id').unsigned().notNullable();
+                    // The shift day, not the calendar day of punch_time — see above.
+                    table.date('date').notNullable();
+                    // 'late_in' | 'early_out' | 'missing_in' — enforced only in JS.
+                    table.string('request_type', 50).notNullable();
+                    // The actual punch that triggered the request, full DATETIME: for a night
+                    // shift this can fall on the calendar day either side of `date`.
+                    table.datetime('punch_time').notNullable();
+                    // Free-form JSON/text blob captured from the mobile punch when available.
+                    table.text('location_data').nullable();
+                    // 'pending' | 'approved' | 'rejected'
+                    table.string('status', 50).defaultTo('pending');
+                    // A users.id, not an employee id.
+                    table.integer('approved_by').unsigned().nullable();
+                    table.timestamp('created_at').notNullable().defaultTo(db.fn.now());
+                    table.timestamp('updated_at').notNullable().defaultTo(db.fn.now());
+                    // Two access shapes, both composite, mirroring attendance_regularizations:
+                    //   employee + day  -> the ingestion engine's duplicate-request check and
+                    //                      the muster day-detail lookup
+                    //   tenant + status -> the admin review queue (getEntryExitRequests)
+                    // Standalone employee_id / company_id indexes would be redundant prefixes
+                    // of these.
+                    table.index(['employee_id', 'date'], 'attendance_entry_requests_emp_date_idx');
+                    table.index(['company_id', 'status'], 'attendance_entry_requests_company_status_idx');
+                });
+                console.log('>>> [DB-SYNC]: attendance_entry_requests table created.');
+            }
+        } catch (e) {
+            console.error('>>> [DB-SYNC-ERROR]: attendance_entry_requests sync failed:', e.message);
+        }
+
     } catch (err) {
         console.error('>>> [DB-SYNC-ERROR]:', err.message);
     }

@@ -216,7 +216,11 @@ class AttendanceRepository {
                       qb2.whereRaw('MONTH(check_in) = ? AND YEAR(check_in) = ? AND DAY(check_in) = 1 AND HOUR(check_in) < 10', [nextM, nextY]);
                   });
             })
-            .select('employee_id', 'check_in', 'check_out', 'status', 'punch_source');
+            // logical_date and review_reason are load-bearing for the muster, not extras:
+            // getMatrix prefers the row's persisted logical_date over re-deriving the day
+            // from check_in, and silently falls back to derivation when the column is not
+            // projected here - so omitting them would leave the fix inert with no error.
+            .select('id', 'employee_id', 'check_in', 'check_out', 'status', 'punch_source', 'logical_date', 'review_reason');
 
         // 3. Get leaves for these employees
         const leaves = await db('leaves as l')

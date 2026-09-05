@@ -390,8 +390,11 @@ router.get('/entry-requests', hasPermission(['approve_attendance']), async (req,
 
 router.post('/entry-requests/:id/status', hasPermission(['approve_attendance']), async (req, res) => {
     try {
-        const { status, attendance_status } = req.body;
-        const result = await attendanceService.approveRejectEntryExitRequest(req.company_id, req.user, req.params.id, status, attendance_status);
+        // arrival_time is what makes a 'missing_in' approval resolvable: the punch the engine
+        // recorded is ambiguous, so the approver supplies the real arrival. Errors from the service
+        // (missing or after-the-punch arrival) surface as the 400 below.
+        const { status, attendance_status, arrival_time } = req.body;
+        const result = await attendanceService.approveRejectEntryExitRequest(req.company_id, req.user, req.params.id, status, attendance_status, arrival_time);
         res.json(result);
     } catch (err) {
         res.status(400).json({ message: err.message });

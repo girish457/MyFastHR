@@ -63,7 +63,7 @@ const ShiftManagement = () => {
 
     // Custom Alert & Confirm States
     const [alertConfig, setAlertConfig] = useState({ show: false, message: '', type: 'info' });
-    const [confirmConfig, setConfirmConfig] = useState({ show: false, message: '', onConfirm: null });
+    const [confirmConfig, setConfirmConfig] = useState({ show: false, message: '', onConfirm: null, onCancel: null });
 
     const showAlert = (message, type = 'info') => {
         setAlertConfig({ show: true, message, type });
@@ -212,9 +212,30 @@ const ShiftManagement = () => {
         }
     };
 
+    // The backend refuses a backdated assignment unless the caller confirms it, because
+    // re-resolving days that were already worked rewrites their muster status and the payroll
+    // computed from it. Clients genuinely need it - rotations here are often keyed in hours or
+    // days after the punches - so ask rather than block, and send the confirmation the API
+    // expects. Without this the API's own error message asks for a flag the UI cannot set.
+    const confirmBackdate = (fromDate) => {
+        const todayStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+        if (!fromDate || fromDate >= todayStr) return Promise.resolve(true);
+        return new Promise((resolve) => {
+            setConfirmConfig({
+                show: true,
+                message: `From Date ${fromDate} is in the past. Attendance already recorded from that date will be re-evaluated against this shift, which can change days that are already settled. Apply anyway?`,
+                onConfirm: () => resolve(true),
+                onCancel: () => resolve(false)
+            });
+        });
+    };
+
     const handleOverrideExecute = async () => {
         if (!selectedShiftId) return showAlert('Select a shift protocol', 'error');
         if (selectedEmployees.length === 0) return showAlert('Select personnel', 'error');
+
+        const allowBackdate = await confirmBackdate(overrideConfig.from_date);
+        if (!allowBackdate) return;
 
         try {
             setLoading(true);
@@ -222,7 +243,8 @@ const ShiftManagement = () => {
                 employee_ids: selectedEmployees.map(e => e.id),
                 shift_id: selectedShiftId,
                 from_date: overrideConfig.from_date,
-                to_date: overrideConfig.to_date || null
+                to_date: overrideConfig.to_date || null,
+                allow_backdate: true
             });
 
             setSuccess(true);
@@ -272,6 +294,10 @@ const ShiftManagement = () => {
         if (e) e.preventDefault();
         if (!shiftConfig.name) return showAlert('Shift Name is required', 'error');
 
+        // Saving a shift also assigns it when personnel are selected, so the same backdate
+        // confirmation applies here as on the override screen.
+        if (selectedEmployees.length > 0 && !(await confirmBackdate(shiftConfig.from_date))) return;
+
         try {
             setLoading(true);
             const postData = {
@@ -306,7 +332,8 @@ const ShiftManagement = () => {
                         employee_ids: selectedEmployees.map(e => e.id),
                         shift_id: editingShiftId,
                         from_date: shiftConfig.from_date,
-                        to_date: shiftConfig.to_date || null
+                        to_date: shiftConfig.to_date || null,
+                        allow_backdate: true
                     });
                 }
 
@@ -320,7 +347,8 @@ const ShiftManagement = () => {
                         employee_ids: selectedEmployees.map(e => e.id),
                         shift_id: shiftRes.id,
                         from_date: shiftConfig.from_date,
-                        to_date: shiftConfig.to_date || null
+                        to_date: shiftConfig.to_date || null,
+                        allow_backdate: true
                     });
                 }
                 showAlert('Shift created successfully!', 'success');
@@ -1612,7 +1640,12 @@ const ShiftManagement = () => {
                             </div>
                             <div className="flex gap-3 w-full">
                                 <button
-                                    onClick={() => setConfirmConfig({ show: false, message: '', onConfirm: null })}
+                                    onClick={() => {
+                                        // Callers that await a decision need to hear "no" too,
+                                        // otherwise they hang with the form stuck loading.
+                                        if (confirmConfig.onCancel) confirmConfig.onCancel();
+                                        setConfirmConfig({ show: false, message: '', onConfirm: null, onCancel: null });
+                                    }}
                                     className="flex-1 py-3.5 bg-slate-155 hover:bg-slate-200 text-slate-600 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer border border-slate-100 active:scale-95"
                                 >
                                     Cancel
@@ -1620,7 +1653,7 @@ const ShiftManagement = () => {
                                 <button
                                     onClick={() => {
                                         if (confirmConfig.onConfirm) confirmConfig.onConfirm();
-                                        setConfirmConfig({ show: false, message: '', onConfirm: null });
+                                        setConfirmConfig({ show: false, message: '', onConfirm: null, onCancel: null });
                                     }}
                                     className="flex-1 py-3.5 bg-indigo-650 hover:bg-indigo-700 bg-indigo-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all cursor-pointer shadow-lg shadow-indigo-50 active:scale-95"
                                 >

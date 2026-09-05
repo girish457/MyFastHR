@@ -50,6 +50,49 @@ function getLogicalDateStr(checkIn, employeeShifts = [], defaultShift = null) {
     return checkInYMD;
 }
 
+// Rows written since ingestion started stamping attendance.logical_date already carry the
+// shift day the engine decided they belong to. Re-deriving it from check_in here re-runs the
+// night-shift guess against whatever shift assignment happens to resolve TODAY, which is how a
+// rotation entered after the punch moves an old row to a different column. Trust the stamp when
+// it is there; every pre-existing row has it NULL, so those still fall back to the derivation.
+function rowLogicalDate(row, employeeShifts = [], defaultShift = null) {
+    if (!row) return null;
+    const persisted = row.logical_date;
+    if (persisted) {
+        // dateStrings:true in knexfile.js means this is normally already 'YYYY-MM-DD', but a
+        // driver/pool without that flag hands back a Date, so normalise both shapes.
+        if (persisted instanceof Date) return toLocalYMD(persisted);
+        const str = String(persisted).trim();
+        if (str) return str.split('T')[0].split(' ')[0];
+    }
+    return getLogicalDateStr(row.check_in, employeeShifts, defaultShift);
+}
+
+// Which of a day's attendance rows represents the day.
+//
+// A day should have one row, but device retries and stale open rows routinely produce more -
+// 120 duplicate groups at one client over 60 days (measured 2026-09-05), and employee 10234 got five rows for
+// punches spanning 22 seconds. dayLogs is sorted ascending by check-in, so the plain
+// dayLogs[0] these call sites used to take picked the EARLIEST row, which is precisely the one
+// nobody ever closed: the cell then read "checked in, no checkout" or Absent while the real
+// completed row sat beside it. That is the "he checked in but it shows as absent" report.
+//
+// Split (4-punch) shifts are the deliberate exception. Two rows a day is their correct shape,
+// session 1 first, and the callers read [0] and [1] as exactly those sessions - so preferring
+// a closed row there would hand back session 2 and break what it is meant to fix.
+function primaryDayLog(dayLogs, resolvedShift = null) {
+    if (!dayLogs || dayLogs.length === 0) return null;
+
+    // An admin's explicit edit outranks any punch, duplicated or not.
+    const manual = dayLogs.find(a => a.punch_source === 'manual' || a.punch_source === 'manual_override');
+    if (manual) return manual;
+
+    const reqPunches = parseInt(resolvedShift?.total_punches_required || resolvedShift?.shift_total_punches || 2);
+    if (reqPunches === 4) return dayLogs[0];
+
+    return dayLogs.find(a => a.check_out) || dayLogs[0];
+}
+
 function checkIfLogUsedGrace(log, employee, rules) {
     if (!log.check_in) return false;
     const logCheckIn = dbDateToUTC(log.check_in);
@@ -153,6 +196,22 @@ function toLocalYYYYMMDDHHmmss(dateVal) {
     return `${y}-${m}-${day} ${hr}:${min}:${sec}`;
 }
 
+// Approvers type an arrival as 'HH:mm' (sometimes 'HH:mm:ss'); the UI may also post a full
+// 'YYYY-MM-DD HH:mm:ss'. A bare time carries no date and belongs to the request's SHIFT day, not to
+// the calendar day the ambiguous punch landed on - for a night shift those differ, and anchoring to
+// the punch's own day would date a 20:10 arrival to the morning after it.
+function resolveRequestPunchTime(rawTime, shiftDayStr) {
+    if (!rawTime || !shiftDayStr) return null;
+    const str = String(rawTime).trim();
+    if (!str) return null;
+    const timeOnly = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(str);
+    if (timeOnly) {
+        const hh = String(timeOnly[1]).padStart(2, '0');
+        return toLocalYYYYMMDDHHmmss(`${shiftDayStr} ${hh}:${timeOnly[2]}:${timeOnly[3] || '00'}`);
+    }
+    return toLocalYYYYMMDDHHmmss(str);
+}
+
 function dateToISTMins(dateVal) {
     if (!dateVal) return 0;
     const d = dbDateToUTC(dateVal);
@@ -217,13 +276,29 @@ function calculateSplitShiftStatus(dayLogs, shift, rules) {
     const s1Start = timeToMins(shift.start_time || shift.shift_start || '09:00');
     const s1End = timeToMins(shift.end_time || shift.shift_end || '18:00');
     const grace1In = parseInt(shift.scheme_grace ?? shift.grace_period ?? shift.shift_grace ?? rules.grace_period ?? 15);
-    const grace1Out = parseInt(shift.session1_grace_out || shift.shift_session1_grace_out || 0);
+    // The muster does not trust a stored 'present' - it recomputes the cell here - so this
+    // threshold has to agree with the one the ingestion engine used, or the grid contradicts
+    // the row it is rendering. machineAttendanceService judges an early departure against
+    // session1_OUT_MARGIN; this only ever read session1_GRACE_OUT, a different column. At
+    // Hotel Highway King the first is 5 minutes and the second is 0, so a 15:57 checkout on a
+    // 16:00 shift stored 'present' and still drew E on the grid.
+    // Both columns express allowed slack at the end of a shift, so take whichever is larger:
+    // that guarantees the grid is never STRICTER than the engine. A genuinely early departure
+    // is already stored as early_out and is matched above without reaching this function.
+    const grace1Out = Math.max(
+        parseInt(shift.session1_out_margin || shift.shift_out_margin || 0),
+        parseInt(shift.session1_grace_out || shift.shift_session1_grace_out || 0)
+    );
 
     if (reqPunches === 4) {
         const s2Start = timeToMins(shift.session2_start_time || shift.shift_session2_start || '14:00');
         const s2End = timeToMins(shift.session2_end_time || shift.shift_session2_end || '18:00');
         const grace2In = parseInt(shift.session2_grace_in || shift.shift_session2_grace_in || 15);
-        const grace2Out = parseInt(shift.session2_grace_out || shift.shift_session2_grace_out || 0);
+        // Same reasoning as grace1Out above, for the second session of a 4-punch shift.
+        const grace2Out = Math.max(
+            parseInt(shift.session2_out_margin || shift.shift_session2_out_margin || 0),
+            parseInt(shift.session2_grace_out || shift.shift_session2_grace_out || 0)
+        );
         const s2InMargin = parseInt(shift.session2_in_margin || shift.shift_session2_in_margin || 30);
 
         // Classify logs using the dynamic Session 2 In Margin
@@ -569,7 +644,7 @@ class AttendanceService {
 
         let latestLog = null;
         for (const log of candidateLogs) {
-            const lDate = getLogicalDateStr(log.check_in, empAssignments, defaultShift);
+            const lDate = rowLogicalDate(log, empAssignments, defaultShift);
             if (lDate === dateStr) {
                 latestLog = log;
                 break;
@@ -1135,6 +1210,12 @@ class AttendanceService {
                 's.terminate_hour',
                 'esa.id'
             )
+            // from_date first, then id - the ordering ATTENDANCE_TROUBLESHOOTING.md records as
+            // the fix for the shift-resolution bug, and the one manualUpdateAttendance already
+            // uses. Ordering by id alone makes the newest ROW win rather than the newest
+            // EFFECTIVE assignment, so the muster could resolve a different shift than the edit
+            // screen for the same day whenever an employee has overlapping assignments.
+            .orderBy('esa.from_date', 'desc')
             .orderBy('esa.id', 'desc') : [];
 
         const formatDbDate = (val) => {
@@ -1167,7 +1248,7 @@ class AttendanceService {
             const empAssignments = shiftAssignmentsByEmployee[empId] || [];
             const defaultShift = employeeInfo ? { start_time: employeeInfo.shift_start, end_time: employeeInfo.shift_end } : null;
             
-            const logicalDate = getLogicalDateStr(a.check_in, empAssignments, defaultShift);
+            const logicalDate = rowLogicalDate(a, empAssignments, defaultShift);
             if (logicalDate) {
                 const [lyStr, lmStr, ldStr] = logicalDate.split('-');
                 const ly = parseInt(lyStr, 10);
@@ -1319,7 +1400,7 @@ class AttendanceService {
                 const dayEarlyOut = entryRequestsMap[emp.id]?.[d];
 
                 if (dayLogs.length > 0) {
-                    const firstLog = dayLogs.find(a => a.punch_source === 'manual' || a.punch_source === 'manual_override') || dayLogs[0];
+                    const firstLog = primaryDayLog(dayLogs, resolvedShift);
                     const dbStatus = firstLog.status ? firstLog.status.toLowerCase() : '';
 
                     const logCheckInDate = dbDateToUTC(firstLog.check_in);
@@ -1576,7 +1657,7 @@ class AttendanceService {
 
         let existing = null;
         for (const log of candidateLogs) {
-            const lDate = getLogicalDateStr(log.check_in, empAssignments, defaultShift);
+            const lDate = rowLogicalDate(log, empAssignments, defaultShift);
             if (lDate === date) {
                 existing = log;
                 break;
@@ -1660,6 +1741,8 @@ class AttendanceService {
                 'check_in',
                 'check_out',
                 'status',
+                'logical_date',
+                'review_reason',
                 'latitude',
                 'longitude',
                 'accuracy',
@@ -1923,15 +2006,17 @@ class AttendanceService {
         for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
             const dateStr = toLocalYMD(d);
             const dayLogs = attendance.filter(a => {
-                const logLogicalDate = getLogicalDateStr(a.check_in, shifts, employee);
+                const logLogicalDate = rowLogicalDate(a, shifts, employee);
                 return logLogicalDate === dateStr;
             });
-            const record = dayLogs.find(a => a.punch_source === 'manual' || a.punch_source === 'manual_override') || dayLogs[0]; // fallback/primary status record
             const shift = shifts.find(s => {
                 const fromStr = toLocalYMD(s.from_date);
                 const toStr = toLocalYMD(s.to_date);
                 return dateStr >= fromStr && (!toStr || dateStr <= toStr);
             });
+            // Same duplicate-row hazard as the muster grid; this sheet must agree with it or
+            // the two screens contradict each other for the same day.
+            const record = primaryDayLog(dayLogs, shift || employee); // fallback/primary status record
 
             const s1Ms = dayLogs[0] && dayLogs[0].check_out ? (new Date(dayLogs[0].check_out) - new Date(dayLogs[0].check_in)) : 0;
             const s2Ms = dayLogs[1] && dayLogs[1].check_out ? (new Date(dayLogs[1].check_out) - new Date(dayLogs[1].check_in)) : 0;
@@ -2023,10 +2108,11 @@ class AttendanceService {
                     grace_period: asg.grace_period
                 }));
                 
-                const logLogicalDate = getLogicalDateStr(a.check_in, formattedAssignments, defaultShift);
+                const logLogicalDate = rowLogicalDate(a, formattedAssignments, defaultShift);
                 return logLogicalDate === date;
             });
-            const record = empLogs.find(a => a.punch_source === 'manual' || a.punch_source === 'manual_override') || empLogs[0];
+            // Same duplicate-row hazard as the muster grid; see primaryDayLog.
+            const record = primaryDayLog(empLogs, activeAssignment || defaultShift);
             const shiftName = activeAssignment?.shift_name || defaultShift?.name || '---';
 
             const s1Ms = empLogs[0] && empLogs[0].check_out ? (new Date(empLogs[0].check_out) - new Date(empLogs[0].check_in)) : 0;
@@ -2082,7 +2168,7 @@ class AttendanceService {
 
             let existing = null;
             for (const log of candidateLogs) {
-                const lDate = getLogicalDateStr(log.check_in, empAssignments, defaultShift);
+                const lDate = rowLogicalDate(log, empAssignments, defaultShift);
                 if (lDate === date) {
                     existing = log;
                     break;
@@ -2262,7 +2348,7 @@ class AttendanceService {
         });
     }
     async assignShift(user, companyId, data) {
-        const { employee_ids, shift_id, from_date, to_date } = data;
+        const { employee_ids, shift_id, from_date, to_date, allow_backdate } = data;
 
         if (!employee_ids || !shift_id || !from_date) {
             throw new Error('Employees, Shift, and From Date are required');
@@ -2270,13 +2356,55 @@ class AttendanceService {
 
         const ids = Array.isArray(employee_ids) ? employee_ids : [employee_ids];
 
+        const fromStr = toLocalYMD(from_date) || String(from_date).split('T')[0];
+        const todayStr = toLocalYMD(new Date());
+
+        // A backdated assignment silently rewrites days that were already worked: the muster and
+        // payroll for those days were computed against the shift that was in force then, and
+        // re-resolving them against the new shift turns settled Present rows into Late/Absent.
+        // Clients do need it for a genuinely missed rotation entry, so it stays possible - but only
+        // when the caller says so explicitly.
+        if (fromStr && todayStr && fromStr < todayStr && allow_backdate !== true) {
+            throw new Error(`From Date ${fromStr} is in the past. Backdating a shift rewrites attendance and payroll for days already worked - resend with allow_backdate: true to confirm.`);
+        }
+
+        // Day before the new assignment starts, walked in IST rather than by string maths so the
+        // month/year boundary and the server's own timezone cannot slide it.
+        const prevDayStr = toLocalYMD(new Date(dbDateToUTC(`${fromStr} 12:00:00`).getTime() - 24 * 60 * 60 * 1000));
+
         // 1. Transactional Update
         await db.transaction(async (trx) => {
+            // Only a PERMANENT assignment (no end date) supersedes what is already on the roster.
+            // A temporary one - a few days' cover - must leave the standing assignment intact, or
+            // the employee is left with no assignment at all the day the cover ends, silently
+            // falling back to employees.shift_id. That is exactly the "no active assignment" state
+            // the roster audit exists to report, and creating it here would be self-defeating.
+            const isPermanent = !to_date;
+
             for (const empId of ids) {
-                // Check for overlapping assignments if needed, for now we just append
-                // or we could replace existing one for the same period.
-                // Requirement: Employees with assigned shifts should NOT be selectable in UI.
-                // So here we assume they are fresh.
+                if (isPermanent) {
+                    // This used to only ever append (its old comment admitted as much), which is why
+                    // 164 of 231 active employees at one client carry several overlapping open-ended
+                    // rows and which shift "wins" is whichever row happened to be inserted last - the
+                    // root cause of per-person skipped punches. Close the running assignment first.
+                    await trx('employee_shift_assignments')
+                        .where({ company_id: companyId, employee_id: empId })
+                        .whereNull('to_date')
+                        .where('from_date', '<', fromStr)
+                        .update({ to_date: prevDayStr });
+
+                    // An open row starting on or after the new from_date covers nothing this
+                    // assignment does not. End-dating it would set to_date < from_date, a row no
+                    // date range can match but which every "does this employee have a shift"
+                    // existence check still counts, so it is removed outright instead. Scoped to
+                    // permanent assignments so a short cover cannot delete a scheduled rotation.
+                    await trx('employee_shift_assignments')
+                        .where({ company_id: companyId, employee_id: empId })
+                        .whereNull('to_date')
+                        .where('from_date', '>=', fromStr)
+                        .del();
+                }
+
                 await trx('employee_shift_assignments').insert({
                     company_id: companyId,
                     employee_id: empId,
@@ -2477,7 +2605,7 @@ class AttendanceService {
         const attendance = await db('attendance')
             .whereIn('employee_id', employeeIds)
             .whereRaw('MONTH(check_in) = ? AND YEAR(check_in) = ?', [month, year])
-            .select('employee_id', 'check_in', 'status');
+            .select('employee_id', 'check_in', 'status', 'logical_date', 'review_reason');
 
         // 2. Get shift assignments
         const qb = db('employee_shift_assignments as esa')
@@ -2690,7 +2818,7 @@ class AttendanceService {
 
         const attendanceLogs = [];
         for (const log of candidateLogs) {
-            const lDate = getLogicalDateStr(log.check_in, empAssignments, defaultShift);
+            const lDate = rowLogicalDate(log, empAssignments, defaultShift);
             if (lDate === dateStr) {
                 attendanceLogs.push(log);
             }
@@ -3484,13 +3612,36 @@ class AttendanceService {
         ).orderBy('r.created_at', 'desc');
     }
 
-    async approveRejectEntryExitRequest(companyId, user, requestId, status, attendanceStatus = 'present') {
+    async approveRejectEntryExitRequest(companyId, user, requestId, status, attendanceStatus = 'present', resolvedTime = null) {
         if (!['approved', 'rejected'].includes(status)) {
             throw new Error('Invalid status value');
         }
 
         const request = await db('attendance_entry_requests').where({ id: requestId, company_id: companyId }).first();
         if (!request) throw new Error('Request not found');
+
+        const dateStr = toLocalYMD(request.date) || request.date;
+        const punchTimeStr = request.punch_time;
+
+        // A 'missing_in' punch landed inside the shift's checkout window with no attendance row for
+        // the day, so the engine could not tell a very late arrival from a lone check-OUT and parked
+        // the punch in check_in. Only the approver knows the real arrival. Validate it BEFORE the
+        // request row is flipped: a throw after that update would leave the request 'approved' with
+        // nothing written to attendance and no way to raise it again.
+        let resolvedPunch = null;
+        if (request.request_type === 'missing_in' && status === 'approved') {
+            resolvedPunch = resolveRequestPunchTime(resolvedTime, dateStr);
+            if (!resolvedPunch) {
+                throw new Error('Actual arrival time is required to approve a missing check-in request - supplying it is the whole purpose of this request type.');
+            }
+            const punchAt = punchTimeStr ? dbDateToUTC(punchTimeStr) : null;
+            const resolvedAt = dbDateToUTC(resolvedPunch);
+            if (punchAt && resolvedAt && resolvedAt.getTime() > punchAt.getTime()) {
+                // The recorded punch becomes this row's check_out, so an arrival later than it would
+                // store check_out < check_in - a corruption already seen in production.
+                throw new Error(`Arrival time ${resolvedPunch} is after the recorded punch ${toLocalYYYYMMDDHHmmss(punchTimeStr)}; the arrival must be the same time or earlier.`);
+            }
+        }
 
         // Update request status
         await db('attendance_entry_requests')
@@ -3501,11 +3652,11 @@ class AttendanceService {
                 updated_at: db.fn.now()
             });
 
-        // Write punch to attendance table if approved
-        if (status === 'approved') {
-            const dateStr = toLocalYMD(request.date) || request.date;
-            const punchTimeStr = request.punch_time;
+        // Rejecting a 'missing_in' still has to reach attendance, to clear the review flag, so the
+        // row lookup below runs for that type in both directions.
+        const touchesAttendance = status === 'approved' || request.request_type === 'missing_in';
 
+        if (touchesAttendance) {
             let dbStatus = 'present';
             if (attendanceStatus === 'late_in' || attendanceStatus === 'late') {
                 dbStatus = 'late';
@@ -3540,8 +3691,8 @@ class AttendanceService {
                 .where('check_in', '<=', `${nextDateStr} 23:59:59`);
 
             // Prefer the row this request was raised FROM: the biometric engine writes the
-            // same punchTimeStr to attendance.check_in (late_in) / check_out (early_out) and
-            // to the request's punch_time, so an exact match is authoritative. The logical-date
+            // same punchTimeStr to attendance.check_in (late_in, missing_in) / check_out (early_out)
+            // and to the request's punch_time, so an exact match is authoritative. The logical-date
             // fallback below can pick a different row on the same calendar date - e.g. a
             // rescued 00:08 night-shift check-in whose request was dated by calendar day, where
             // the fallback landed on the employee's real 15:45 row and stamped it late.
@@ -3560,7 +3711,7 @@ class AttendanceService {
 
             if (!existingAtt) {
                 for (const log of candidateLogs) {
-                    const lDate = getLogicalDateStr(log.check_in, empAssignments, defaultShift);
+                    const lDate = rowLogicalDate(log, empAssignments, defaultShift);
                     if (lDate === dateStr) {
                         existingAtt = log;
                         break;
@@ -3568,7 +3719,30 @@ class AttendanceService {
                 }
             }
 
-            if (request.request_type === 'late_in') {
+            if (status === 'rejected') {
+                // Only 'missing_in' gets here. Rejecting says "this is not a missing check-in"; the
+                // device's times stay exactly as recorded. The flag must still be cleared - leaving
+                // review_reason set would keep the row flagged for review forever with no path out,
+                // the same dead end the 'pending' status hit before 04a64cd.
+                if (existingAtt) {
+                    const rejectUpdates = {
+                        review_reason: null,
+                        updated_at: db.fn.now()
+                    };
+                    // The row was stamped 'pending' by the engine solely to hold it for this
+                    // decision. With the request rejected and the flag cleared, nothing is left
+                    // that could ever move it off 'pending' - the muster would render it Absent
+                    // forever and only a manual override could rescue it. Settle it instead:
+                    // present when the day has a pair, absent when the punch still stands alone,
+                    // which is what a rejected "the check-in is missing" claim actually means.
+                    if ((existingAtt.status || '').toLowerCase() === 'pending') {
+                        rejectUpdates.status = existingAtt.check_out ? 'present' : 'absent';
+                    }
+                    await db('attendance')
+                        .where({ id: existingAtt.id })
+                        .update(rejectUpdates);
+                }
+            } else if (request.request_type === 'late_in') {
                 if (!existingAtt) {
                     await db('attendance').insert({
                         employee_id: request.employee_id,
@@ -3577,6 +3751,10 @@ class AttendanceService {
                         check_out: null,
                         status: dbStatus,
                         punch_source: 'entry_request',
+                        // The request is already dated by SHIFT day, so stamp it rather than
+                        // leaving readers to re-derive the day from check_in - a night-shift
+                        // late-in is exactly the row that derivation places wrongly.
+                        logical_date: dateStr,
                         created_at: db.fn.now()
                     });
                 } else {
@@ -3607,6 +3785,38 @@ class AttendanceService {
                         company_id: companyId,
                         check_in: punchTimeStr || `${dateStr} 12:00:00`,
                         check_out: punchTimeStr || `${dateStr} 18:00:00`,
+                        status: dbStatus,
+                        punch_source: 'entry_request',
+                        logical_date: dateStr,
+                        created_at: db.fn.now()
+                    });
+                }
+            } else if (request.request_type === 'missing_in') {
+                if (existingAtt) {
+                    const updates = {
+                        check_in: resolvedPunch,
+                        status: dbStatus,
+                        punch_source: 'entry_request',
+                        review_reason: null,
+                        updated_at: db.fn.now()
+                    };
+                    // The ambiguous punch was parked in check_in only so a later punch could still
+                    // close the row. Now that the real arrival is known, that punch is the day's
+                    // check-OUT - unless a later punch already closed the row, which is then the
+                    // truer departure and must not be overwritten.
+                    if (!existingAtt.check_out && wantedPunch) {
+                        updates.check_out = wantedPunch;
+                    }
+                    await db('attendance')
+                        .where({ id: existingAtt.id })
+                        .update(updates);
+                } else {
+                    await db('attendance').insert({
+                        employee_id: request.employee_id,
+                        company_id: companyId,
+                        check_in: resolvedPunch,
+                        check_out: wantedPunch || punchTimeStr || null,
+                        logical_date: dateStr,
                         status: dbStatus,
                         punch_source: 'entry_request',
                         created_at: db.fn.now()

@@ -50,6 +50,80 @@ const formatTimeAMPM = (timeStr) => {
     return `${strHours}:${minutes} ${ampm}`;
 };
 
+// Entry/Exit exception request types. Keep this the single source of truth so a new
+// request_type degrades to a readable fallback instead of silently reading "Early Out".
+const REQUEST_TYPE_META = {
+    late_in: { label: 'Late In', title: 'Late In Request', pill: 'bg-rose-50 text-rose-600' },
+    early_out: { label: 'Early Out', title: 'Early Out Request', pill: 'bg-amber-50 text-amber-600' },
+    missing_in: { label: 'Missing Check-In', title: 'Missing Check-In Request', pill: 'bg-indigo-50 text-indigo-600' }
+};
+
+const getRequestTypeMeta = (type) => {
+    if (type && REQUEST_TYPE_META[type]) return REQUEST_TYPE_META[type];
+    const fallback = String(type || 'exception').replace(/_/g, ' ');
+    return { label: fallback, title: `${fallback} Request`, pill: 'bg-slate-100 text-slate-600' };
+};
+
+// Why a recorded punch pair still needs a human look before it is treated as fact.
+const REVIEW_REASON_META = {
+    checkout_window_unpaired: {
+        caption: 'Check-in missing - punch direction not confirmed',
+        message: 'Only one punch reached us for this day, and it landed in the check-out window. It could be a late arrival, or it could be the punch out with the check-in never delivered. Confirm the real arrival time before treating this as the check-in.'
+    },
+    early_before_in_margin: {
+        caption: 'Punched before the allowed check-in window',
+        message: 'This punch arrived earlier than the shift allows for a check-in. It has been recorded as-is, so check it against the roster before treating it as the arrival time.'
+    },
+    closed_after_termination: {
+        caption: 'Day closed by a late-arriving punch',
+        message: 'This day was closed by a punch that came in after the shift cut-off hour. The check-out time shown may not be when the employee actually left.'
+    }
+};
+
+const getReviewReasonMeta = (reason) => REVIEW_REASON_META[reason] || {
+    caption: 'Flagged for review',
+    message: 'This punch pair was flagged for review. Confirm the times before treating them as final.'
+};
+
+// A lone punch in the check-out window: the shown time may be the punch OUT, not the arrival.
+// Keyed off REVIEW_REASON_META so the reason string is written once on this side of the wire.
+const UNPAIRED_PUNCH_REASON = 'checkout_window_unpaired';
+const isUnpairedPunch = (row) => row?.review_reason === UNPAIRED_PUNCH_REASON;
+
+// Shown next to the punch time itself, where the caption alone is too far away to stop
+// someone reading "Punch In 05:00 pm" as established fact. Both punch cards use it; their
+// surrounding chrome differs enough (sizes, the Info button) that sharing a component would
+// cost more than it saves, but this sentence must not be allowed to drift between them.
+const UNPAIRED_PUNCH_HINT = 'Not confirmed as the arrival - this may be the punch out.';
+
+const ReviewReasonNotice = ({ reason }) => {
+    if (!reason) return null;
+    const meta = getReviewReasonMeta(reason);
+    return (
+        <div className="bg-amber-50/30 border border-amber-100 p-3 rounded-xl flex gap-2 items-start">
+            <AlertCircle size={12} className="text-amber-500 mt-0.5 shrink-0" />
+            <div className="leading-relaxed">
+                <span className="text-[8px] font-black text-amber-600 uppercase tracking-widest block">{meta.caption}</span>
+                <p className="text-[9.5px] font-bold text-slate-600 mt-1">{meta.message}</p>
+            </div>
+        </div>
+    );
+};
+
+// Normalizes a shift start time ("09:00:00", "9:00 AM") into an <input type="time"> value.
+const toTimeInputValue = (timeVal) => {
+    if (!timeVal) return '';
+    const str = String(timeVal).trim();
+    const match = str.match(/(\d{1,2}):(\d{2})/);
+    if (!match) return '';
+    let hours = parseInt(match[1], 10);
+    if (isNaN(hours)) return '';
+    if (/pm/i.test(str) && hours < 12) hours += 12;
+    if (/am/i.test(str) && hours === 12) hours = 0;
+    if (hours > 23) return '';
+    return `${String(hours).padStart(2, '0')}:${match[2]}`;
+};
+
 const AttendanceMuster = () => {
     const [searchParams] = useSearchParams();
     const initialTab = searchParams.get('tab') === 'entry_requests' ? 'entry_requests' : 'muster';
@@ -78,6 +152,9 @@ const AttendanceMuster = () => {
     const [selectedEmployee, setSelectedEmployee] = useState(null);
     const [selectedCell, setSelectedCell] = useState(null);
     const [modalData, setModalData] = useState(null);
+
+    // Derived once: the markup below tests it four times across two punch cards.
+    const attendanceUnpaired = isUnpairedPunch(modalData?.attendance);
     const [punchHistoryOpen, setPunchHistoryOpen] = useState(false);
     const [modalLoading, setModalLoading] = useState(false);
     const [modalError, setModalError] = useState(null);
@@ -91,6 +168,20 @@ const AttendanceMuster = () => {
     const [approvingId, setApprovingId] = useState(null);
     const [preApprovingId, setPreApprovingId] = useState(null);
     const [approvalModalRequest, setApprovalModalRequest] = useState(null);
+    const [arrivalTime, setArrivalTime] = useState('');
+    const [approvalError, setApprovalError] = useState(null);
+
+    // Reset (and pre-fill) the approval modal inputs whenever a different request is opened
+    useEffect(() => {
+        setApprovalError(null);
+        if (!approvalModalRequest || approvalModalRequest.request_type !== 'missing_in') {
+            setArrivalTime('');
+            return;
+        }
+        setArrivalTime(toTimeInputValue(
+            approvalModalRequest.shift_start_time || approvalModalRequest.shift_start || approvalModalRequest.start_time
+        ));
+    }, [approvalModalRequest]);
 
     const handleCellClick = async (emp, day) => {
         const formattedDate = `${selectedYear}-${String(selectedMonth).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
@@ -165,14 +256,23 @@ const AttendanceMuster = () => {
         }
     };
 
-    const handleRequestAction = async (id, status, attendanceStatus = 'present') => {
+    const handleRequestAction = async (id, status, attendanceStatus = 'present', arrivalTimeValue = null) => {
         try {
             setApprovingId(id);
-            await api.post(`/attendance/entry-requests/${id}/status`, { status, attendance_status: attendanceStatus });
+            setApprovalError(null);
+            const payload = { status, attendance_status: attendanceStatus };
+            // Only sent for missing_in approvals - late_in / early_out post exactly as before
+            if (arrivalTimeValue) payload.arrival_time = arrivalTimeValue;
+            await api.post(`/attendance/entry-requests/${id}/status`, payload);
             await fetchEntryRequests();
             setApprovalModalRequest(null);
         } catch (err) {
-            alert(err.response?.data?.message || err.message);
+            const message = err.response?.data?.message || err.message || 'Could not update this request.';
+            if (approvalModalRequest && approvalModalRequest.id === id) {
+                setApprovalError(message);
+            } else {
+                alert(message);
+            }
         } finally {
             setApprovingId(null);
         }
@@ -188,7 +288,7 @@ const AttendanceMuster = () => {
                 date: today
             });
             await fetchEntryRequests();
-            alert(`Pre-approved ${type === 'late_in' ? 'Late In' : 'Early Out'} for today!`);
+            alert(`Pre-approved ${getRequestTypeMeta(type).label} for today!`);
         } catch (err) {
             alert(err.response?.data?.message || err.message);
         } finally {
@@ -561,6 +661,10 @@ const AttendanceMuster = () => {
     const avgLateCount = totalHeadcount > 0
         ? (matrix.reduce((acc, emp) => acc + (emp.stats.L || 0), 0) / totalHeadcount).toFixed(1)
         : '0.0';
+
+    // A missing_in approval cannot be posted until the manager states the real arrival time
+    const isMissingInApproval = approvalModalRequest?.request_type === 'missing_in';
+    const approvalActionsBlocked = isMissingInApproval && !arrivalTime;
 
     return (
         <div className="space-y-6 max-w-[1700px] mx-auto animate-in fade-in duration-500 pb-10 px-2">
@@ -1099,7 +1203,7 @@ const AttendanceMuster = () => {
                                             <div className="flex flex-col items-center justify-center h-full opacity-40 p-6 text-center">
                                                 <CheckCircle size={32} className="text-emerald-500 mb-2" />
                                                 <p className="text-[10px] font-black uppercase tracking-widest">All Clear</p>
-                                                <p className="text-[9px] font-bold text-slate-400 mt-1">No pending late-in or early-out exceptions found.</p>
+                                                <p className="text-[9px] font-bold text-slate-400 mt-1">No pending attendance exceptions found.</p>
                                             </div>
                                         ) : (
                                             <div className="divide-y divide-slate-50">
@@ -1125,10 +1229,8 @@ const AttendanceMuster = () => {
                                                                 )}
                                                             </div>
                                                             <div className="flex items-center gap-1.5 flex-wrap pt-1">
-                                                                <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter ${
-                                                                    req.request_type === 'late_in' ? 'bg-rose-50 text-rose-600' : 'bg-amber-50 text-amber-600'
-                                                                }`}>
-                                                                    {req.request_type === 'late_in' ? 'Late In' : 'Early Out'}
+                                                                <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter ${getRequestTypeMeta(req.request_type).pill}`}>
+                                                                    {getRequestTypeMeta(req.request_type).label}
                                                                 </span>
                                                                 <span className="text-[9px] font-bold text-slate-400 uppercase">
                                                                     Date: {req.date ? new Date(req.date).toLocaleDateString() : 'N/A'}
@@ -1142,7 +1244,7 @@ const AttendanceMuster = () => {
                                                         </div>
                                                         <div className="flex items-center gap-2">
                                                             <button
-                                                                onClick={() => setApprovalModalRequest(req)}
+                                                                onClick={() => { setApprovalError(null); setApprovalModalRequest(req); }}
                                                                 disabled={approvingId === req.id}
                                                                 className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[9px] font-black uppercase tracking-widest transition-all shadow-sm shadow-emerald-100 disabled:opacity-50 cursor-pointer animate-in fade-in duration-150"
                                                             >
@@ -1191,10 +1293,8 @@ const AttendanceMuster = () => {
                                                                 )}
                                                             </div>
                                                             <div className="flex items-center gap-1.5 flex-wrap pt-1">
-                                                                <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter ${
-                                                                    req.request_type === 'late_in' ? 'bg-rose-50 text-rose-600' : 'bg-amber-50 text-amber-600'
-                                                                }`}>
-                                                                    {req.request_type === 'late_in' ? 'Late In' : 'Early Out'}
+                                                                <span className={`px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter ${getRequestTypeMeta(req.request_type).pill}`}>
+                                                                    {getRequestTypeMeta(req.request_type).label}
                                                                 </span>
                                                                 <span className="text-[9px] font-bold text-slate-400 uppercase">
                                                                     Date: {req.date ? new Date(req.date).toLocaleDateString() : 'N/A'}
@@ -1422,7 +1522,9 @@ const AttendanceMuster = () => {
                                                 {/* Render all check-in/check-out logs */}
                                                 <h4 className="text-[9.5px] font-black text-slate-400 uppercase tracking-widest mt-4">Punches Record ({modalData.attendance_logs.length} Session Logs)</h4>
                                                 <div className="space-y-3">
-                                                    {modalData.attendance_logs.map((log, idx) => (
+                                                    {modalData.attendance_logs.map((log, idx) => {
+                                                      const logUnpaired = isUnpairedPunch(log);
+                                                      return (
                                                         <div key={log.id || idx} className="border border-slate-150 p-4 rounded-2xl bg-white space-y-3 shadow-xs">
                                                             <div className="flex justify-between items-center border-b border-slate-100 pb-2">
                                                                 <span className="text-[9px] font-black text-slate-450 uppercase tracking-widest">Punch Entry #{idx + 1}</span>
@@ -1431,12 +1533,17 @@ const AttendanceMuster = () => {
                                                                 </span>
                                                             </div>
                                                             <div className="grid grid-cols-2 gap-4">
-                                                                <div className="bg-emerald-50/20 border border-emerald-100 p-3 rounded-xl space-y-1">
-                                                                    <span className="text-[8px] font-black text-emerald-600 uppercase tracking-widest">Check In</span>
+                                                                <div className={`p-3 rounded-xl space-y-1 border ${logUnpaired ? 'bg-amber-50/25 border-amber-100' : 'bg-emerald-50/20 border-emerald-100'}`}>
+                                                                    <span className={`text-[8px] font-black uppercase tracking-widest ${logUnpaired ? 'text-amber-600' : 'text-emerald-600'}`}>
+                                                                        {logUnpaired ? 'Punch Recorded' : 'Check In'}
+                                                                    </span>
                                                                     <h4 className="text-xs font-black text-slate-800">
                                                                         {log.check_in ? new Date(log.check_in).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true }) : '--:--'}
                                                                     </h4>
                                                                     <p className="text-[8px] font-bold text-slate-400 leading-none mt-1">Source: {log.punch_source || 'device'}</p>
+                                                                    {logUnpaired && (
+                                                                        <p className="text-[8px] font-bold text-amber-600 leading-snug mt-1">{UNPAIRED_PUNCH_HINT}</p>
+                                                                    )}
                                                                 </div>
                                                                 <div className="bg-slate-50/50 border border-slate-200/60 p-3 rounded-xl space-y-1">
                                                                     <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Check Out</span>
@@ -1450,6 +1557,9 @@ const AttendanceMuster = () => {
                                                                     <p className="text-[8px] font-bold text-slate-400 leading-none mt-1">Device: {log.device_id || 'N/A'}</p>
                                                                 </div>
                                                             </div>
+                                                            {log.review_reason && (
+                                                                <ReviewReasonNotice reason={log.review_reason} />
+                                                            )}
                                                             {(log.punch_location || log.remarks || log.out_punch_location || log.out_remarks) && (
                                                                 <div className="bg-slate-50/30 border border-slate-100 p-3 rounded-xl space-y-2 text-[9px] font-bold text-slate-700">
                                                                     {log.punch_location && (
@@ -1483,7 +1593,8 @@ const AttendanceMuster = () => {
                                                                 </div>
                                                             )}
                                                         </div>
-                                                    ))}
+                                                      );
+                                                    })}
                                                 </div>
                                             </div>
                                         ) : modalData.attendance ? (
@@ -1492,9 +1603,11 @@ const AttendanceMuster = () => {
                                                 
                                                 <div className="grid grid-cols-2 gap-4">
                                                     {/* In Record */}
-                                                    <div className="bg-emerald-50/20 border border-emerald-100 p-4 rounded-2xl space-y-2">
+                                                    <div className={`p-4 rounded-2xl space-y-2 border ${attendanceUnpaired ? 'bg-amber-50/25 border-amber-100' : 'bg-emerald-50/20 border-emerald-100'}`}>
                                                         <div className="flex justify-between items-center">
-                                                            <span className="text-[8px] font-black text-emerald-600 uppercase tracking-widest">Punch In</span>
+                                                            <span className={`text-[8px] font-black uppercase tracking-widest ${attendanceUnpaired ? 'text-amber-600' : 'text-emerald-600'}`}>
+                                                                {attendanceUnpaired ? 'Punch Recorded' : 'Punch In'}
+                                                            </span>
                                                             <button 
                                                                 onClick={(e) => { e.stopPropagation(); setPunchHistoryOpen(true); }}
                                                                 className="text-slate-400 hover:text-indigo-600 transition-colors p-0.5 cursor-pointer flex items-center justify-center rounded hover:bg-slate-100"
@@ -1507,6 +1620,9 @@ const AttendanceMuster = () => {
                                                             {modalData.attendance.check_in ? new Date(modalData.attendance.check_in).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: true }) : '--:--'}
                                                         </h4>
                                                         <p className="text-[9px] font-bold text-slate-400 leading-none">Source: {modalData.attendance.punch_source || 'device'}</p>
+                                                        {attendanceUnpaired && (
+                                                            <p className="text-[8.5px] font-bold text-amber-600 leading-snug">{UNPAIRED_PUNCH_HINT}</p>
+                                                        )}
                                                     </div>
 
                                                     {/* Out Record */}
@@ -1531,6 +1647,10 @@ const AttendanceMuster = () => {
                                                         <p className="text-[9px] font-bold text-slate-400 leading-none">Device: {modalData.attendance.device_id || 'N/A'}</p>
                                                     </div>
                                                 </div>
+
+                                                {modalData.attendance.review_reason && (
+                                                    <ReviewReasonNotice reason={modalData.attendance.review_reason} />
+                                                )}
 
                                                 {/* Coordinates and Location Mapping */}
                                                 {(modalData.attendance.latitude || modalData.attendance.longitude || modalData.attendance.punch_location || modalData.attendance.remarks) && (
@@ -1672,7 +1792,7 @@ const AttendanceMuster = () => {
                                                 <div className="border border-orange-100 bg-orange-50/10 p-4 rounded-2xl space-y-3 shadow-xs">
                                                     <div className="flex justify-between items-center">
                                                         <span className="text-[9px] font-black text-orange-500 uppercase tracking-widest">
-                                                            {modalData.entry_request.request_type === 'late_in' ? 'Late In Request' : 'Early Out Request'}
+                                                            {getRequestTypeMeta(modalData.entry_request.request_type).title}
                                                         </span>
                                                         <span className={`px-2 py-0.5 rounded-full text-[8.5px] font-black uppercase border ${
                                                             modalData.entry_request.status === 'approved' ? 'bg-emerald-50 border-emerald-100 text-emerald-600' :
@@ -1690,7 +1810,7 @@ const AttendanceMuster = () => {
                                                         </div>
                                                         <div>
                                                             <span className="text-slate-400 text-[8px] font-black uppercase block mb-0.5">Request Type</span>
-                                                            <span className="capitalize">{modalData.entry_request.request_type.replace('_', ' ')}</span>
+                                                            <span className="capitalize">{getRequestTypeMeta(modalData.entry_request.request_type).label}</span>
                                                         </div>
                                                     </div>
 
@@ -1845,13 +1965,13 @@ const AttendanceMuster = () => {
 
                                 {/* Section 2: Late In / Early Out Requests */}
                                 <div className="space-y-2">
-                                    <h4 className="text-[9px] font-black text-orange-500 uppercase tracking-widest">Late In / Early Out Requests</h4>
+                                    <h4 className="text-[9px] font-black text-orange-500 uppercase tracking-widest">Entry / Exit Requests</h4>
                                     {modalData.entry_requests && modalData.entry_requests.length > 0 ? (
                                         <div className="divide-y divide-slate-50 border border-slate-100 rounded-2xl overflow-hidden bg-slate-50/30">
                                             {modalData.entry_requests.map((er) => (
                                                 <div key={er.id} className="p-3 text-[10px] font-bold text-slate-700 space-y-1">
                                                     <div className="flex justify-between items-center">
-                                                        <span className="uppercase text-[8.5px] font-black text-slate-600">{er.request_type.replace('_', ' ')}</span>
+                                                        <span className="uppercase text-[8.5px] font-black text-slate-600">{getRequestTypeMeta(er.request_type).label}</span>
                                                         <span className={`px-1.5 py-0.5 rounded text-[8px] font-black uppercase ${
                                                             er.status === 'approved' ? 'bg-emerald-50 text-emerald-600' :
                                                             er.status === 'rejected' ? 'bg-rose-50 text-rose-600' :
@@ -1869,7 +1989,7 @@ const AttendanceMuster = () => {
                                         </div>
                                     ) : (
                                         <div className="text-[9.5px] font-bold text-slate-455 italic p-3 border border-slate-100 rounded-2xl text-center bg-slate-50/10">
-                                            No late/early requests submitted.
+                                            No entry/exit requests submitted.
                                         </div>
                                     )}
                                 </div>
@@ -2093,7 +2213,7 @@ const AttendanceMuster = () => {
                             <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 space-y-1">
                                 <p className="text-[10px] font-bold text-slate-500 uppercase">Request Details</p>
                                 <div className="flex justify-between text-xs font-bold text-slate-700">
-                                    <span>Type: <span className="text-indigo-600 capitalize">{approvalModalRequest.request_type?.replace('_', ' ') || ''}</span></span>
+                                    <span>Type: <span className="text-indigo-600 capitalize">{getRequestTypeMeta(approvalModalRequest.request_type).label}</span></span>
                                     <span>Date: {approvalModalRequest.date ? new Date(approvalModalRequest.date).toLocaleDateString() : 'N/A'}</span>
                                 </div>
                                 {approvalModalRequest.punch_time && (
@@ -2101,34 +2221,64 @@ const AttendanceMuster = () => {
                                 )}
                             </div>
 
+                            {isMissingInApproval && (
+                                <div className="space-y-2.5">
+                                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Actual Arrival Time</p>
+                                    <div className="bg-amber-50/30 border border-amber-100 p-3.5 rounded-2xl space-y-2.5">
+                                        <div className="flex gap-2 items-start">
+                                            <AlertCircle size={12} className="text-amber-500 mt-0.5 shrink-0" />
+                                            <p className="text-[9.5px] font-bold text-slate-600 leading-relaxed">
+                                                Only one punch reached us for this day and the check-in is missing. Enter the time the employee actually arrived: it is saved as the check-in, and the recorded punch{approvalModalRequest.punch_time ? ` (${formatPunchTime(approvalModalRequest.punch_time)})` : ''} becomes the check-out.
+                                            </p>
+                                        </div>
+                                        <input
+                                            type="time"
+                                            value={arrivalTime}
+                                            onChange={(e) => { setArrivalTime(e.target.value); setApprovalError(null); }}
+                                            className="w-full bg-white border border-slate-200 hover:border-slate-300 rounded-xl px-3 py-2 text-xs font-black text-slate-700 outline-none shadow-inner"
+                                        />
+                                        {approvalActionsBlocked && (
+                                            <p className="text-[9px] font-black text-amber-600 uppercase tracking-wider">Enter the arrival time to enable approval.</p>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+
+                            {approvalError && (
+                                <div className="p-3.5 bg-rose-50 border border-rose-100 rounded-2xl flex items-start gap-2.5 text-rose-700">
+                                    <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                                    <span className="text-[10px] font-bold leading-relaxed">{approvalError}</span>
+                                </div>
+                            )}
+
                             <div className="space-y-3">
                                 <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Select Mark Option</p>
                                 <div className="grid grid-cols-1 gap-2.5">
                                     <button
-                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'present')}
-                                        disabled={approvingId === approvalModalRequest.id}
-                                        className="w-full py-3 bg-emerald-50 hover:bg-emerald-100/75 text-emerald-700 border border-emerald-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2"
+                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'present', isMissingInApproval ? arrivalTime : null)}
+                                        disabled={approvingId === approvalModalRequest.id || approvalActionsBlocked}
+                                        className="w-full py-3 bg-emerald-50 hover:bg-emerald-100/75 text-emerald-700 border border-emerald-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         Mark Full Day (Present)
                                     </button>
                                     <button
-                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'late_in')}
-                                        disabled={approvingId === approvalModalRequest.id}
-                                        className="w-full py-3 bg-amber-50 hover:bg-amber-100/75 text-amber-700 border border-amber-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2"
+                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'late_in', isMissingInApproval ? arrivalTime : null)}
+                                        disabled={approvingId === approvalModalRequest.id || approvalActionsBlocked}
+                                        className="w-full py-3 bg-amber-50 hover:bg-amber-100/75 text-amber-700 border border-amber-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         Mark Late In
                                     </button>
                                     <button
-                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'half_day')}
-                                        disabled={approvingId === approvalModalRequest.id}
-                                        className="w-full py-3 bg-cyan-50 hover:bg-cyan-100/75 text-cyan-700 border border-cyan-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2"
+                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'half_day', isMissingInApproval ? arrivalTime : null)}
+                                        disabled={approvingId === approvalModalRequest.id || approvalActionsBlocked}
+                                        className="w-full py-3 bg-cyan-50 hover:bg-cyan-100/75 text-cyan-700 border border-cyan-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         Mark Half Day
                                     </button>
                                     <button
-                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'early_out')}
-                                        disabled={approvingId === approvalModalRequest.id}
-                                        className="w-full py-3 bg-orange-50 hover:bg-orange-100/75 text-orange-700 border border-orange-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2"
+                                        onClick={() => handleRequestAction(approvalModalRequest.id, 'approved', 'early_out', isMissingInApproval ? arrivalTime : null)}
+                                        disabled={approvingId === approvalModalRequest.id || approvalActionsBlocked}
+                                        className="w-full py-3 bg-orange-50 hover:bg-orange-100/75 text-orange-700 border border-orange-200 rounded-2xl text-[10px] font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         Mark Early Out
                                     </button>
