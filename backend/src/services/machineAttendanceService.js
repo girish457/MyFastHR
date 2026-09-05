@@ -226,6 +226,61 @@ function shiftById(db, shiftId) {
 }
 
 /**
+ * The row that already governs `logicalDate` for this employee, if the day has one.
+ *
+ * Only rows carrying attendance.shift_id qualify: that column is stamped once, at the moment
+ * the session opens, so the row it sits on is a record of what the employee was ACTUALLY
+ * working that day - which the roster, editable at any time and retroactively, is not.
+ * Rows written before the column existed have it NULL and are ignored, leaving the
+ * roster-based resolution they have always had.
+ */
+function pinnedRowForDay(db, employeeId, companyId, logicalDate) {
+    return db('attendance')
+        .where({ employee_id: employeeId, company_id: companyId })
+        .whereNotNull('shift_id')
+        .where('logical_date', logicalDate)
+        .orderBy('check_in', 'desc')
+        .first();
+}
+
+/**
+ * The shift the PREVIOUS logical day actually ran under, for the night-shift lookback.
+ *
+ * The lookback decides whether a punch in the small hours belongs to yesterday's shift, and
+ * it used to answer that from employee_shift_assignments alone. So an admin entering a night
+ * rotation over a day that was already worked and settled retroactively made that settled day
+ * a night shift: the next morning's ordinary arrival then fell inside yesterday's checkout
+ * window, adopted yesterday's closed row and overwrote its check_out - destroying the settled
+ * day AND swallowing the new one, which got no row at all.
+ *
+ * Yesterday's own row knows better than today's roster does, so ask it first. When the day
+ * produced no pinned row - no punches, or a row that pre-dates attendance.shift_id - this
+ * falls back to exactly the resolution it always used.
+ */
+async function prevDayShift(db, employeeId, companyId, prevDateStr, fallbackShiftId) {
+    const prevRow = await pinnedRowForDay(db, employeeId, companyId, prevDateStr);
+    if (prevRow) {
+        const pinned = await db('shifts').where('id', prevRow.shift_id).first();
+        if (pinned) return pinned;
+    }
+
+    const assigned = await db('employee_shift_assignments as esa')
+        .join('shifts as s', 'esa.shift_id', 's.id')
+        .where('esa.employee_id', employeeId)
+        .where('esa.from_date', '<=', prevDateStr)
+        .andWhere(qb => {
+            qb.where('esa.to_date', '>=', prevDateStr).orWhereNull('esa.to_date');
+        })
+        .select('s.*')
+        .orderBy('esa.from_date', 'desc')
+        .orderBy('esa.id', 'desc')
+        .first();
+
+    if (assigned) return assigned;
+    return fallbackShiftId ? await db('shifts').where('id', fallbackShiftId).first() : null;
+}
+
+/**
  * Decides what a punch arriving after an open row's shift has terminated actually is.
  *
  * Termination is measured against the ASSIGNED shift, so whenever that assignment is wrong
@@ -657,23 +712,7 @@ class MachineAttendanceService {
 
             let prevShift = null;
             if (employeeWithShift) {
-                const activeAssignment = await db('employee_shift_assignments as esa')
-                    .join('shifts as s', 'esa.shift_id', 's.id')
-                    .where('esa.employee_id', employeeId)
-                    .where('esa.from_date', '<=', prevDateStr)
-                    .andWhere(qb => {
-                        qb.where('esa.to_date', '>=', prevDateStr).orWhereNull('esa.to_date');
-                    })
-                    .select('s.*')
-                    .orderBy('esa.from_date', 'desc')
-                    .orderBy('esa.id', 'desc')
-                    .first();
-
-                if (activeAssignment) {
-                    prevShift = activeAssignment;
-                } else {
-                    prevShift = await db('shifts').where('id', employeeWithShift.shift_id).first();
-                }
+                prevShift = await prevDayShift(db, employeeId, companyId, prevDateStr, employeeWithShift.shift_id);
             }
 
             if (prevShift && isNightShift(prevShift)) {
@@ -743,6 +782,36 @@ class MachineAttendanceService {
             if (activeAssignment) {
                 applyResolvedShift(employeeWithShift, activeAssignment);
                 resolvedShiftId = activeAssignment.assigned_shift_id;
+            }
+        }
+
+        // HOW MANY PUNCHES A LOGICAL DAY IS SHAPED BY IS SETTLED BY THE DAY, NOT BY THE ROSTER.
+        //
+        // The pin above only speaks for an OPEN row, so the moment a session closes the engine
+        // went back to asking the roster - which can have been edited since. A 4-punch split
+        // day whose employee is reassigned to a 2-punch shift the same day then reads
+        // total_punches_required=2 while session 1 sits closed on the table, so session 2's
+        // arrival takes the 2-punch fallback below and lands on session 1's SETTLED row: a
+        // 4h+4h day collapses into one 09:00-21:05 row and session 2 never gets a row at all.
+        //
+        // A day that already produced a pinned row has already declared its shape. When that
+        // shape AGREES with the roster's - the ordinary case, a split-to-split rotation
+        // included - nothing changes here and session 2 is still judged by the new shift's own
+        // session-2 window. Only when the two disagree can the roster's shift not describe
+        // this day (a 2-punch shift has no session 2 to route into), and then the shift the
+        // day was actually recorded under has to govern the rest of this punch.
+        //
+        // Deliberately above the session-1 backup below: origShiftEnd is what the 4-punch
+        // router uses to place a punch between the sessions, so it has to be the adopted
+        // shift's, not the one the roster has since moved to.
+        if (!pinnedShift && employeeWithShift) {
+            const dayRow = await pinnedRowForDay(db, employeeId, companyId, targetShiftDate);
+            const dayShift = dayRow ? await shiftById(db, dayRow.shift_id) : null;
+
+            if (dayShift
+                && parseInt(dayShift.shift_total_punches || 2) !== parseInt(employeeWithShift.shift_total_punches || 2)) {
+                applyResolvedShift(employeeWithShift, dayShift);
+                resolvedShiftId = dayShift.assigned_shift_id;
             }
         }
 
@@ -882,24 +951,7 @@ class MachineAttendanceService {
                     const prevDateObj = new Date(punchTime.getTime() - 24 * 60 * 60 * 1000);
                     const prevDateStr = dateToISTDateString(prevDateObj);
 
-                    let prevShift = null;
-                    const activeAssignment = await db('employee_shift_assignments as esa')
-                        .join('shifts as s', 'esa.shift_id', 's.id')
-                        .where('esa.employee_id', employeeId)
-                        .where('esa.from_date', '<=', prevDateStr)
-                        .andWhere(qb => {
-                            qb.where('esa.to_date', '>=', prevDateStr).orWhereNull('esa.to_date');
-                        })
-                        .select('s.*')
-                        .orderBy('esa.from_date', 'desc')
-                        .orderBy('esa.id', 'desc')
-                        .first();
-
-                    if (activeAssignment) {
-                        prevShift = activeAssignment;
-                    } else {
-                        prevShift = await db('shifts').where('id', employeeWithShift.shift_id).first();
-                    }
+                    const prevShift = await prevDayShift(db, employeeId, companyId, prevDateStr, employeeWithShift.shift_id);
 
                     if (prevShift && isNightShift(prevShift)) {
                         const prevShiftStartStr = prevShift.start_time || '09:00';
@@ -938,6 +990,52 @@ class MachineAttendanceService {
                 if (reloadedShift) {
                     applyResolvedShift(employeeWithShift, reloadedShift);
                     resolvedShiftId = reloadedShift.assigned_shift_id;
+                }
+            }
+        }
+
+        // A SETTLED ROW IS NOT UP FOR GRABS.
+        //
+        // activeLog on the 2-punch path is routinely a CLOSED row - the fallback above hands
+        // one over whenever the day has any row at all - and the checkout routine then writes
+        // check_out onto it unconditionally. The only thing standing between that and a
+        // destroyed day was the post-termination skip further down, which fires only when the
+        // punch is PAST the row's termination hour. A punch that is merely before it falls
+        // through every guard and rewrites a finished day's exit.
+        //
+        // That is not hypothetical: enter a night rotation over an already-settled day and the
+        // next morning's ordinary arrival is pulled back into that day, adopts its closed row,
+        // rewrites 09:00-18:00 into 09:00 -> next-day 09:00 and marks it absent - while the day
+        // that arrival actually belongs to gets no row at all.
+        //
+        // Two things disqualify a punch from being a settled row's checkout, and both are the
+        // engine's existing tests rather than new heuristics: it reads as this person's
+        // ARRIVAL on its own calendar day (looksLikeArrivalOnPunchDay, the same test the
+        // late-checkout rescue uses to avoid swallowing two days), or it sits further from the
+        // check-in than any one shift a human could have worked. Either way it is a different
+        // session, so the row is released and the punch opens its own - the punch is never
+        // discarded, and the settled row is never touched.
+        //
+        // What is deliberately still allowed: a later punch on the same day, within one
+        // plausible worked span, correcting a checkout that was already recorded. That is the
+        // self-healing from ec630fd - a sub-half-day tap settles the row, the real exit
+        // arrives hours later and moves check_out to the truth.
+        if (activeLog && activeLog.check_out !== null && employeeWithShift) {
+            const settledCheckIn = dbDateToUTC(activeLog.check_in);
+            const gapHours = (punchTime.getTime() - settledCheckIn.getTime()) / (1000 * 60 * 60);
+            const belongsToAnotherDay = dateToISTDateString(settledCheckIn) !== dateStr
+                && await looksLikeArrivalOnPunchDay(db, employeeId, punchTime, dateStr, employeeWithShift.shift_id);
+
+            if (belongsToAnotherDay || gapHours > MAX_PLAUSIBLE_WORKED_HOURS) {
+                activeLog = null;
+                pinnedShift = null;
+                targetShiftDate = dateStr;
+
+                const ownDayShift = await assignedShiftForDate(db, employeeId, targetShiftDate)
+                    || await shiftById(db, employeeWithShift.shift_id);
+                if (ownDayShift) {
+                    applyResolvedShift(employeeWithShift, ownDayShift);
+                    resolvedShiftId = ownDayShift.assigned_shift_id;
                 }
             }
         }

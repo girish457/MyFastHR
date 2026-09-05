@@ -56,6 +56,9 @@ const SHIFT_FLEXI = 990012;
 const SHIFT_SPLIT = 990013;    // 4-punch
 const SHIFT_LATE = 990014;     // 12:00-21:00, starts later than SHIFT_DAY and ends later
 const SHIFT_SPLIT_LATE = 990015; // 4-punch, 09:00-13:00 / 19:00-23:30
+// 20:00-05:00 with a 4h terminate_hour, so its checkout window reaches 09:00 the next
+// morning - far enough to swallow an ordinary day-shift arrival, which is the point.
+const SHIFT_NIGHT_LONG = 990016;
 
 let employeeSeq = 990100;
 
@@ -99,7 +102,8 @@ async function seedCommon() {
         { ...baseShift, id: SHIFT_FLEXI, name: 'Replay Flexi', start_time: '00:00', end_time: '23:59', is_flexi: 1, session1_in_margin: 0, session1_out_margin: 0, terminate_hour: null },
         { ...baseShift, id: SHIFT_SPLIT, name: 'Replay Split', start_time: '07:00', end_time: '12:00', total_punches_required: 4, session2_start_time: '18:00', session2_end_time: '23:00', session2_in_margin: 30, session2_out_margin: 5 },
         { ...baseShift, id: SHIFT_LATE, name: 'Replay 12-21', start_time: '12:00', end_time: '21:00' },
-        { ...baseShift, id: SHIFT_SPLIT_LATE, name: 'Replay Split Late', start_time: '09:00', end_time: '13:00', total_punches_required: 4, session2_start_time: '19:00', session2_end_time: '23:30', session2_in_margin: 30, session2_out_margin: 5 }
+        { ...baseShift, id: SHIFT_SPLIT_LATE, name: 'Replay Split Late', start_time: '09:00', end_time: '13:00', total_punches_required: 4, session2_start_time: '19:00', session2_end_time: '23:30', session2_in_margin: 30, session2_out_margin: 5 },
+        { ...baseShift, id: SHIFT_NIGHT_LONG, name: 'Replay 20-05', start_time: '20:00', end_time: '05:00', terminate_hour: 4 }
     ]);
 }
 
@@ -697,6 +701,151 @@ async function scenarioOverlappingAssignmentsResolveByFromDate() {
     check(s, 'and it is the shift pinned to the row', await shiftIdsFor(e.id), [SHIFT_DAY]);
 }
 
+/**
+ * A settled day must survive a rotation entered ON TOP of it - and the next day must still
+ * get its own row.
+ *
+ * 09-10 is worked and closed under the 06:00-16:00 shift. An admin then enters a night
+ * rotation covering 09-10 (routine: rosters are usually filled in after the fact). The
+ * night shift's checkout window runs to 09:00 on 09-11, so the employee's ordinary 06:00
+ * arrival the next morning was pulled back onto 09-10, adopted that day's CLOSED row and
+ * rewrote it: 06:00-15:57 present became 06:00 -> 09-11 06:00 absent, and 09-11 got no row
+ * at all. Two days destroyed by one roster edit, and both punches involved were real.
+ *
+ * The night-shift lookback now asks what 09-10 was actually RECORDED under - its own pinned
+ * row - instead of what the roster now says about it.
+ */
+async function scenarioNightRotationEnteredOverSettledDay() {
+    const s = 'night rotation entered over a settled day';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    await punch(e.code, '2026-09-10 15:57:00');
+
+    // The rotation covers only 09-10, so 09-11 still resolves to the standing day shift.
+    await db('employee_shift_assignments').insert({
+        company_id: CO, employee_id: e.id, shift_id: SHIFT_NIGHT_LONG,
+        from_date: '2026-09-10', to_date: '2026-09-10'
+    });
+
+    const arrival = await punch(e.code, '2026-09-11 06:00:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'the arrival opens a row, it is not read as yesterday\'s exit', arrival.status, 'check-in');
+    check(s, 'two rows, one per day', rows.length, 2);
+    check(s, 'the settled day is byte-for-byte untouched', rows[0], {
+        in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'the next morning gets its own row', rows[1].in, '2026-09-11 06:00:00');
+    const newest = await db('attendance').where({ employee_id: e.id, company_id: CO }).orderBy('check_in', 'desc').first();
+    check(s, 'dated to its own day, not pulled back onto the settled one',
+        String(newest.logical_date).slice(0, 10), '2026-09-11');
+    check(s, 'and pinned to the shift 09-11 actually resolves to', Number(newest.shift_id), SHIFT_DAY);
+}
+
+/**
+ * The backstop, exercised on its own: a punch that reads as this person's ARRIVAL on its own
+ * day must never be written onto a previous day's settled row - even when the previous day
+ * genuinely WAS the night shift, so nothing upstream is wrong.
+ *
+ * 09-10 is worked and closed as a real 20:00 -> 04:55 night. That shift's checkout window
+ * runs to 09:00, and the employee then rotates onto mornings and arrives 06:00 on 09-11. The
+ * 2-punch fallback hands the closed 09-10 row over as activeLog, the punch is not past
+ * termination so the post-termination skip never fires, and the checkout routine rewrote a
+ * finished night into 20:00 -> 06:00 while 09-11 got no row. It is an arrival, so it opens
+ * its own row and the night keeps its real exit.
+ */
+async function scenarioArrivalNeverOverwritesSettledRow() {
+    const s = 'arrival never overwrites a settled row';
+    const e = await makeEmployee(SHIFT_NIGHT_LONG);
+    await punch(e.code, '2026-09-10 20:00:00');
+    await punch(e.code, '2026-09-11 04:55:00');   // 09-10 settled, closed across midnight
+    await reassign(e.id, SHIFT_DAY, '2026-09-11');
+    await punch(e.code, '2026-09-11 06:00:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'two rows', rows.length, 2);
+    check(s, 'the night keeps its real exit', rows[0], {
+        in: '2026-09-10 20:00:00', out: '2026-09-11 04:55:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'the morning arrival opens its own row', rows[1].in, '2026-09-11 06:00:00');
+    check(s, 'on the shift it actually arrived for', await shiftIdsFor(e.id), [SHIFT_NIGHT_LONG, SHIFT_DAY]);
+}
+
+/**
+ * Split (4-punch) days are shaped by the day, not by the roster's current shift.
+ *
+ * Session 1 (09:00-13:00) is worked and closed, then an admin reassigns the employee to a
+ * 2-punch 12:00-21:00 shift effective the SAME day. total_punches_required then read 2, so
+ * session 2's arrival took the 2-punch fallback and landed on session 1's SETTLED row: the
+ * 4h+4h day collapsed into a single 09:00-19:00 row, session 2 never got a row, and the
+ * final 23:25 exit was thrown away as past-termination. A control run of the identical day
+ * without the reassignment produces two rows, which is what isolates the roster edit.
+ *
+ * The day already declared its shape by pinning session 1 to a 4-punch shift; a 2-punch
+ * shift has no session 2 to route into, so the day's own shift governs the rest of it.
+ */
+async function scenarioSplitDayReassignedToTwoPunchShift() {
+    const s = 'split day reassigned to a 2-punch shift';
+    const e = await makeEmployee(SHIFT_SPLIT_LATE);
+    await punch(e.code, '2026-09-10 09:00:00');
+    await punch(e.code, '2026-09-10 13:00:00');            // session 1 closes correctly
+    await reassign(e.id, SHIFT_LATE, '2026-09-10');        // 12:00-21:00, 2 punches, same day
+    await punch(e.code, '2026-09-10 19:00:00');
+    await punch(e.code, '2026-09-10 23:25:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'still two rows, one per session', rows.length, 2);
+    check(s, 'session 1 is untouched by the reassignment', rows[0], {
+        in: '2026-09-10 09:00:00', out: '2026-09-10 13:00:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'session 2 opens and closes its own row', rows[1], {
+        in: '2026-09-10 19:00:00', out: '2026-09-10 23:25:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'both sessions keep the shift the day ran under', await shiftIdsFor(e.id), [SHIFT_SPLIT_LATE, SHIFT_SPLIT_LATE]);
+    check(s, 'no request raised', await requestsFor(e.id), []);
+}
+
+/** The control for the scenario above: the same split day with no roster edit. */
+async function scenarioSplitDayControlWithoutReassignment() {
+    const s = 'split day control, no reassignment';
+    const e = await makeEmployee(SHIFT_SPLIT_LATE);
+    await punch(e.code, '2026-09-10 09:00:00');
+    await punch(e.code, '2026-09-10 13:00:00');
+    await punch(e.code, '2026-09-10 19:00:00');
+    await punch(e.code, '2026-09-10 23:25:00');
+
+    const rows = await rowsFor(e.id);
+    check(s, 'two rows', rows.length, 2);
+    check(s, 'session 1 closed at 13:00', rows[0].out, '2026-09-10 13:00:00');
+    check(s, 'session 2 closed at 23:25', rows[1].out, '2026-09-10 23:25:00');
+}
+
+/**
+ * Protecting settled rows must not mean freezing them. A closed row is still correctable by
+ * a genuine later exit on the same day - the self-healing shipped in ec630fd.
+ *
+ * A stray tap an hour after arrival is past the 2-minute dedup, so it settles the row at
+ * 07:00 and the day reads absent (under half a day). The real 15:57 exit then has to move
+ * check_out to the truth and restore the day to present. If the new guard refused every write
+ * to a closed row, this employee would keep a one-hour day forever.
+ */
+async function scenarioSettledRowStillCorrectedBySameDayExit() {
+    const s = 'settled row still corrected by the same day\'s real exit';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    await punch(e.code, '2026-09-10 07:00:00');   // stray tap: closes the row at 1h worked
+
+    check(s, 'the stray tap settles the row short', (await rowsFor(e.id))[0], {
+        in: '2026-09-10 06:00:00', out: '2026-09-10 07:00:00', status: 'absent', source: 'biometric', review: null
+    });
+
+    await punch(e.code, '2026-09-10 15:57:00');   // the real exit
+
+    check(s, 'the real exit corrects the same row', await rowsFor(e.id), [
+        { in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present', source: 'biometric', review: null }
+    ]);
+}
+
 const SCENARIOS = [
     scenarioLateTerminationCheckout,
     scenarioStaleRowNotAbsorbed,
@@ -725,7 +874,12 @@ const SCENARIOS = [
     scenarioBeforeShiftStartWithNoOpenRow,
     scenarioUnpinnedRowStillClosed,
     scenarioSplitShiftReassignedBetweenSessions,
-    scenarioOverlappingAssignmentsResolveByFromDate
+    scenarioOverlappingAssignmentsResolveByFromDate,
+    scenarioNightRotationEnteredOverSettledDay,
+    scenarioArrivalNeverOverwritesSettledRow,
+    scenarioSplitDayReassignedToTwoPunchShift,
+    scenarioSplitDayControlWithoutReassignment,
+    scenarioSettledRowStillCorrectedBySameDayExit
 ];
 
 async function main() {
