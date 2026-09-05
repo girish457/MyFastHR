@@ -3767,9 +3767,14 @@ class AttendanceService {
                 updated_at: db.fn.now()
             });
 
-        // Rejecting a 'missing_in' still has to reach attendance, to clear the review flag, so the
-        // row lookup below runs for that type in both directions.
-        const touchesAttendance = status === 'approved' || request.request_type === 'missing_in';
+        // Every decision has to reach attendance, in both directions. The engine stamps the row
+        // 'pending' purely to hold it for this decision, and nothing else can ever move it off
+        // that status - so rejecting an early_out or a late_in used to leave the row 'pending'
+        // forever. The muster's pending-with-checkout branch then recomputes the cell as E and
+        // counts a full present day, making a REJECTED early out indistinguishable from an
+        // approved one. 04a64cd already established settle-on-reject for missing_in; the other
+        // types need it for the same reason.
+        const touchesAttendance = true;
 
         if (touchesAttendance) {
             let dbStatus = 'present';
@@ -3835,23 +3840,28 @@ class AttendanceService {
             }
 
             if (status === 'rejected') {
-                // Only 'missing_in' gets here. Rejecting says "this is not a missing check-in"; the
-                // device's times stay exactly as recorded. The flag must still be cleared - leaving
-                // review_reason set would keep the row flagged for review forever with no path out,
-                // the same dead end the 'pending' status hit before 04a64cd.
+                // A rejection never rewrites times: the device's punches stay exactly as recorded.
+                // It clears the review flag - leaving review_reason set would keep the row flagged
+                // for review forever with no path out - and settles the holding 'pending' status on
+                // what the device actually recorded, since the exception was not granted.
                 if (existingAtt) {
                     const rejectUpdates = {
                         review_reason: null,
                         updated_at: db.fn.now()
                     };
-                    // The row was stamped 'pending' by the engine solely to hold it for this
-                    // decision. With the request rejected and the flag cleared, nothing is left
-                    // that could ever move it off 'pending' - the muster would render it Absent
-                    // forever and only a manual override could rescue it. Settle it instead:
-                    // present when the day has a pair, absent when the punch still stands alone,
-                    // which is what a rejected "the check-in is missing" claim actually means.
                     if ((existingAtt.status || '').toLowerCase() === 'pending') {
-                        rejectUpdates.status = existingAtt.check_out ? 'present' : 'absent';
+                        if (request.request_type === 'early_out') {
+                            // Unexcused early departure. Leaving it 'pending' rendered the same E
+                            // cell an APPROVED early out gets, so the rejection had no visible
+                            // effect anywhere.
+                            rejectUpdates.status = 'early_out';
+                        } else if (request.request_type === 'late_in') {
+                            rejectUpdates.status = 'late';
+                        } else {
+                            // missing_in: rejecting says "this is not a missing check-in". Present
+                            // when the day has a pair, absent when the punch still stands alone.
+                            rejectUpdates.status = existingAtt.check_out ? 'present' : 'absent';
+                        }
                     }
                     await db('attendance')
                         .where({ id: existingAtt.id })
