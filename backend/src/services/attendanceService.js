@@ -2925,6 +2925,70 @@ class AttendanceService {
         };
     }
 
+    /**
+     * Audit trail for the LEGACY ingestion route, and nothing else.
+     *
+     * POST /api/attendance/machine-log -> processMachineLog is a second punch ingestion path,
+     * separate from the modern /Device/SaveDevice -> machineAttendanceService.processPunch
+     * engine and carrying none of its fixes. Its worst property was not the missing fixes but
+     * the silence: it never wrote biometric_raw_logs at all, so a device still posting here
+     * produced attendance rows with no audit trail whatsoever and there was no query that could
+     * tell whether the route was live or dead. It cannot be retired on a guess.
+     *
+     * One row per received punch, tagged status='legacy_route', turns that into a count anyone
+     * can run:
+     *   SELECT DATE(created_at), device_serial, COUNT(*) FROM biometric_raw_logs
+     *   WHERE status = 'legacy_route' GROUP BY 1, 2;
+     * A full payroll cycle of zeros is the evidence the route can be closed.
+     *
+     * THIS MUST NEVER FAIL A PUNCH. The route is live in production, and observability that can
+     * drop real attendance is strictly worse than the blindness it replaces - so every error is
+     * swallowed here. It cannot throw into processMachineLog's per-log try/catch either, which
+     * would mark the punch failed and skip it: that is exactly why the catch is inside this
+     * method rather than around the call. A missing column, a constraint, a connection blip -
+     * the punch still processes byte for byte as it did before.
+     *
+     * company_id is 0 deliberately: the legacy route is company-blind (it resolves an employee
+     * globally by employee_id_number and never scopes by tenant), and this row is written before
+     * that lookup so the punches it REJECTS are logged too. Join employee_code against
+     * employees.employee_id_number to attribute a row to a company.
+     */
+    async _auditLegacyRoutePunch(rawLog) {
+        try {
+            const log = (rawLog && typeof rawLog === 'object') ? rawLog : {};
+            // Same field aliases the loop below reads, so the audit row describes the punch as
+            // processMachineLog actually understood it - including one it is about to reject.
+            const empCode = log.employee_code || log.employee_id || log.EnrollNumber || log.UserId || log.badgenumber || log.emp_code || log.CardNo;
+            const rawTime = log.timestamp || log.log_time || log.datetime || log.PunchTime || log.time;
+            const deviceId = log.device_id || log.device_serial || log.serial_number || log.device || 'BIOMETRIC_DEV';
+
+            const rawTimeStr = (rawTime === undefined || rawTime === null) ? null : String(rawTime);
+            const parsed = rawTimeStr
+                ? new Date(rawTimeStr.includes('+') ? rawTimeStr : `${rawTimeStr} +05:30`)
+                : null;
+            const parsedOk = !!(parsed && !isNaN(parsed.getTime()));
+            // punch_time is NOT NULL, so an unparseable timestamp falls back to the receipt
+            // instant and says so in error_details rather than losing the whole audit row.
+            const punchTime = toLocalYYYYMMDDHHmmss(parsedOk ? parsed : new Date());
+
+            await db('biometric_raw_logs').insert({
+                company_id: 0,
+                device_serial: String(deviceId).slice(0, 100),
+                employee_code: String(empCode === undefined || empCode === null ? '(missing)' : empCode).slice(0, 50),
+                punch_time: punchTime,
+                status: 'legacy_route',
+                error_details:
+                    'POST /api/attendance/machine-log (legacy route, attendanceService.processMachineLog). ' +
+                    `raw_timestamp=${rawTimeStr === null ? '(missing)' : rawTimeStr}` +
+                    (parsedOk ? '' : ' [unparseable - punch_time is the receipt time]')
+            });
+        } catch (error) {
+            // Never rethrow. The only acceptable consequence of a broken audit write is a log line.
+            console.error('>>> [BIOMETRIC-LEGACY]: audit write failed, punch processing continues:',
+                error && error.message);
+        }
+    }
+
     async processMachineLog(payload) {
         console.log('>>> [BIOMETRIC]: Processing push logs:', JSON.stringify(payload));
 
@@ -2950,6 +3014,10 @@ class AttendanceService {
         };
 
         for (const log of logs) {
+            // First, before any decision about this punch: leave evidence that the legacy route
+            // received it. Cannot throw - see _auditLegacyRoutePunch.
+            await this._auditLegacyRoutePunch(log);
+
             try {
                 const empCode = log.employee_code || log.employee_id || log.EnrollNumber || log.UserId || log.badgenumber || log.emp_code || log.CardNo;
                 const rawTime = log.timestamp || log.log_time || log.datetime || log.PunchTime || log.time;
