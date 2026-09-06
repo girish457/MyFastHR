@@ -985,6 +985,46 @@ async function scenarioArrivalSurvivesARosterThatDoesNotDescribeIt() {
         { in: '2026-09-11 06:00:00', out: '2026-09-11 16:00:00' });
 }
 
+/**
+ * An admin's manual correction must survive the employee's later punch.
+ *
+ * primaryDayLog is built on the rule "an admin's explicit edit outranks any punch", and it
+ * identifies such a row by punch_source = 'manual'. But both checkout paths wrote
+ * punch_source: 'biometric' unconditionally, and a third write recomputed `status` from the
+ * punches - so the moment the employee punched out, the marker that made the rule work was
+ * erased along with the admin's decision. An admin who marked someone Absent at 10:00 watched
+ * it silently revert to a computed letter the instant that person clocked out.
+ *
+ * The punch itself is still recorded: the check_out is written, and the row is flagged so the
+ * disagreement between the admin and the device is visible instead of being resolved silently
+ * in the device's favour.
+ */
+async function scenarioManualEditSurvivesLaterPunch() {
+    const s = 'an admin edit is not reverted by the punch that follows it';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-14 06:00:00');
+    await db('attendance')
+        .where({ employee_id: e.id, company_id: CO })
+        .update({ status: 'absent', punch_source: 'manual' });
+
+    await punch(e.code, '2026-09-14 15:58:00');
+    const rows = await rowsFor(e.id);
+    check(s, 'one row', rows.length, 1);
+    check(s, 'the checkout is still recorded - the punch is never discarded', rows[0].out, '2026-09-14 15:58:00');
+    check(s, "the admin's status stands", rows[0].status, 'absent');
+    check(s, 'and their manual marker is not overwritten', rows[0].source, 'manual');
+    check(s, 'the disagreement is flagged for a human', rows[0].review, 'punch_after_manual_edit');
+
+    // Control: the identical day with no admin edit must behave exactly as before.
+    const c = await makeEmployee(SHIFT_DAY);
+    await punch(c.code, '2026-09-14 06:00:00');
+    await punch(c.code, '2026-09-14 15:58:00');
+    const ctrl = await rowsFor(c.id);
+    check(s, 'an ordinary day is untouched by the guard', 
+        { out: ctrl[0].out, source: ctrl[0].source, review: ctrl[0].review },
+        { out: '2026-09-14 15:58:00', source: 'biometric', review: null });
+}
+
 const SCENARIOS = [
     scenarioLateTerminationCheckout,
     scenarioStaleRowNotAbsorbed,
@@ -1022,7 +1062,8 @@ const SCENARIOS = [
     scenarioSameDayRotationCannotReopenSettledDay,
     scenarioNightToDayRotationFilesOnItsOwnDay,
     scenarioLongPostRotationExitIsNotDiscarded,
-    scenarioArrivalSurvivesARosterThatDoesNotDescribeIt
+    scenarioArrivalSurvivesARosterThatDoesNotDescribeIt,
+    scenarioManualEditSurvivesLaterPunch
 ];
 
 async function main() {

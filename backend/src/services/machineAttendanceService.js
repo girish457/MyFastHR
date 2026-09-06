@@ -160,8 +160,31 @@ const REVIEW_REASONS = {
     // recorded day actually ran under. The roster has moved them onto a shift that does not
     // describe the day they are working; the punch is recorded so the day survives and
     // flagged so the roster gets fixed.
-    ARRIVAL_OUTSIDE_ROSTER_SHIFT: 'arrival_outside_roster_shift'
+    ARRIVAL_OUTSIDE_ROSTER_SHIFT: 'arrival_outside_roster_shift',
+    // A punch closed a row an admin had explicitly set by hand. The punch is recorded, but the
+    // admin's status and their `manual` marker are kept: primaryDayLog treats punch_source
+    // 'manual' as outranking any punch, and overwriting it back to 'biometric' silently
+    // reverted the correction and re-derived the letter from the punches the admin had just
+    // overruled. Flagged because the two disagree and a human has to decide which is right.
+    PUNCH_AFTER_MANUAL_EDIT: 'punch_after_manual_edit'
 };
+
+// An admin's explicit edit outranks a punch (the rule primaryDayLog is built on), so a punch
+// closing that row must record itself WITHOUT erasing the edit. Returns the fields a checkout
+// may safely write: the check_out always, the source/status only when no admin has spoken.
+function isManualEdit(activeLog) {
+    return !!activeLog &&
+        (activeLog.punch_source === 'manual' || activeLog.punch_source === 'manual_override');
+}
+
+function checkoutFieldsPreservingManualEdit(activeLog, fields) {
+    if (!isManualEdit(activeLog)) return fields;
+    const preserved = { ...fields };
+    delete preserved.punch_source;   // keep 'manual' so primaryDayLog still honours the edit
+    delete preserved.status;         // keep the status the admin chose
+    preserved.review_reason = REVIEW_REASONS.PUNCH_AFTER_MANUAL_EDIT;
+    return preserved;
+}
 
 // Every place that resolves an employee_shift_assignments row onto `employeeWithShift` selects
 // exactly these columns under exactly these aliases. It was written out three times, and a
@@ -1894,14 +1917,14 @@ class MachineAttendanceService {
                 // Update check_out and set status to 'pending' because it requires approval
                 await db('attendance')
                     .where({ id: activeLog.id })
-                    .update({
+                    .update(checkoutFieldsPreservingManualEdit(activeLog, {
                         check_out: punchTimeStr,
                         status: 'pending',
                         punch_source: 'biometric',
                         device_id: deviceIdString(deviceSerial),
                         review_reason: resolvedReviewReason,
                         updated_at: db.fn.now()
-                    });
+                    }));
 
                 // Record audit log
                 await db('biometric_raw_logs').insert({
@@ -1919,13 +1942,13 @@ class MachineAttendanceService {
             // Normal/non-blocked checkout: Update check_out
             await db('attendance')
                 .where({ id: activeLog.id })
-                .update({
+                .update(checkoutFieldsPreservingManualEdit(activeLog, {
                     check_out: punchTimeStr,
                     punch_source: 'biometric',
                     device_id: deviceIdString(deviceSerial),
                     review_reason: resolvedReviewReason,
                     updated_at: db.fn.now()
-                });
+                }));
 
             // Calculate and update status in database on checkout
             let newStatus = activeLog.status || 'present';
@@ -1957,9 +1980,14 @@ class MachineAttendanceService {
                 }
             }
 
-            await db('attendance')
-                .where({ id: activeLog.id })
-                .update({ status: newStatus });
+            // Second write to the same row, so it needs the same guard as the one above: the
+            // status recomputed from the punches must not overwrite a status an admin set by
+            // hand. Without this the update() above preserves the edit and this line undoes it.
+            if (!isManualEdit(activeLog)) {
+                await db('attendance')
+                    .where({ id: activeLog.id })
+                    .update({ status: newStatus });
+            }
 
             // Record audit log
             await db('biometric_raw_logs').insert({
