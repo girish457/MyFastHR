@@ -29,16 +29,19 @@ to `machineAttendanceService.js`, and add a scenario for the bug you are fixing.
 attendance fix before this one was verified with a throwaway script that was then discarded,
 which is why the same bugs kept coming back.
 
-The read path (muster / history sheet / date-wise / day-detail) has two more:
+The read path (muster / history sheet / date-wise / day-detail / the employee's own
+"My Attendance") has two more:
 ```bash
 npm run resolver:test    # ~250 pure assertions on services/attendance/dayResolver.js, NO database
-npm run readpath:replay  # asserts all four read screens agree cell for cell on seeded fixtures
+npm run readpath:replay  # asserts all five read screens agree cell for cell on seeded fixtures
 ```
 `resolver:test` needs nothing but node and runs in ~50ms, so run it on every save while editing
 `services/attendance/dayResolver.js` or `time.js` — those two modules are pure by contract (no
 `db`/knex import, no clock read; `now`/`todayStr` arrive as arguments) and the test asserts that
 contract as well as the behaviour. `readpath:replay` needs the same kind of scratch DB as
-`punch:replay`; its header has the setup. **Run all three before and after any change to
+`punch:replay`; its header has the setup, and it asserts that all FIVE read screens answer
+the same letter for the same day - a read screen that is not in that harness is a screen free
+to drift back out of alignment, so wire any new one in. **Run all three before and after any change to
 `attendanceService.js`, `dayResolver.js` or `machineAttendanceService.js`.**
 
 `backend/scripts/` also holds `auditShiftAssignments.js`, a read-only report of employees with

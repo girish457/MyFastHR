@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * Read-path regression harness — the muster/history/date-wise/day-detail analogue of
- * replayPunches.js.
+ * Read-path regression harness — the muster / history sheet / date-wise / day-detail /
+ * my-attendance analogue of replayPunches.js.
  *
  * replayPunches.js guards the WRITE path: what processPunch() stores for a sequence of
  * punches. Nothing guarded the READ path, and that is where the last round of bugs lived:
- * four screens render the same stored row and each one used to decide for itself what the
+ * five screens render the same stored row and each one used to decide for itself what the
  * row meant. A day could read OFF on the admin grid, Absent on the employee's history sheet
  * and Absent again on the date-wise screen, with the day-detail drawer showing a status
- * letter next to a sentence that contradicted it — all from one unchanged database row.
+ * letter next to a sentence that contradicted it — all from one unchanged database row. The
+ * employee's own "My Attendance" screen was worse still: it did no resolution at all and
+ * printed the raw database word (`pending`, `late`) at the person it was about.
  *
  * So this harness seeds deterministic days (every shift type x pinned vs unpinned shift_id x
- * weekoff / holiday / leave / future-date overlay x the status letters), then asks all four
+ * weekoff / holiday / leave / future-date overlay x the status letters), then asks all five
  * read functions about the same employee-month and asserts they agree cell for cell. A screen
- * that starts answering differently from the other three fails here.
+ * that starts answering differently from the other four fails here.
  *
  * SAFETY: refuses to run against a database whose name is not clearly a scratch database.
  * It creates and drops its own fixture rows, so pointing it at real data would destroy them.
@@ -366,6 +368,27 @@ async function readDateWise(month, year) {
     return byDay;
 }
 
+/**
+ * The fifth screen: "My Attendance", what the EMPLOYEE reads about themselves
+ * (attendanceService.getHistory -> GET /api/attendance/history).
+ *
+ * It was the read path never fixed - a raw `SELECT *` with no shift and no status resolution,
+ * printing the database word `pending` / `late` straight at the employee while the muster
+ * beside it said E / L, and carrying no row at all for a weekoff, a holiday, a leave day or a
+ * future date. It is asserted here so it can never drift back out of alignment.
+ *
+ * The service takes `user`; `employee_id` on it short-circuits getEmployeeId, so the fixtures
+ * do not need a linked `users` row.
+ */
+async function readMyAttendance(empId, month, year) {
+    const rows = await attendanceService.getHistory(
+        { id: null, employee_id: empId }, CO, month, year
+    );
+    const byDay = {};
+    rows.forEach(r => { byDay[parseInt(r.date.split('-')[2], 10)] = r.status; });
+    return byDay;
+}
+
 /** Only the cells that differ, so a failure names the disagreement instead of dumping a month. */
 function diffGrid(actual, expected, days) {
     const out = {};
@@ -396,12 +419,14 @@ async function scenarioPastMonthAgreement() {
     for (const [key, emp] of Object.entries(EMPLOYEES)) {
         const grid = matrix[emp.id] ? matrix[emp.id].days : {};
         const history = await readHistory(emp.id, PAST_M, PAST_Y);
+        const mine = await readMyAttendance(emp.id, PAST_M, PAST_Y);
         const dw = {};
         for (const d of ALL_DAYS) dw[d] = dateWise[d][emp.id];
 
         check(s, `${key}: muster matches the seeded fixtures`, diffGrid(grid, emp.expectPast, ALL_DAYS), {});
         check(s, `${key}: history sheet matches the muster`, diffGrid(history, grid, ALL_DAYS), {});
         check(s, `${key}: date-wise screen matches the muster`, diffGrid(dw, grid, ALL_DAYS), {});
+        check(s, `${key}: my-attendance matches the muster`, diffGrid(mine, grid, ALL_DAYS), {});
     }
 }
 
@@ -429,12 +454,14 @@ async function scenarioCurrentMonthFutureDays() {
     for (const [key, emp] of Object.entries(EMPLOYEES)) {
         const grid = matrix[emp.id] ? matrix[emp.id].days : {};
         const history = await readHistory(emp.id, CUR_M, CUR_Y);
+        const mine = await readMyAttendance(emp.id, CUR_M, CUR_Y);
         const dw = {};
         for (const d of days) dw[d] = dateWise[d][emp.id];
 
         check(s, `${key}: muster leaves future days blank`, diffGrid(grid, expected, days), {});
         check(s, `${key}: history sheet matches the muster`, diffGrid(history, grid, days), {});
         check(s, `${key}: date-wise screen matches the muster`, diffGrid(dw, grid, days), {});
+        check(s, `${key}: my-attendance matches the muster`, diffGrid(mine, grid, days), {});
     }
 }
 
@@ -545,13 +572,98 @@ async function scenarioRequestStatesInTheDrawer() {
         rejected.explanation === approved.explanation, false);
 }
 
+/**
+ * The employee's own screen, read as a payload rather than as a grid.
+ *
+ * The cell-for-cell checks above prove it AGREES with the muster. This proves the thing the
+ * employee actually sees: never a raw database word, and a row for every day of the month
+ * including the ones with no punch at all - the weekoff, the holiday, the approved leave and
+ * the date that has not happened yet, none of which existed in this payload before.
+ */
+const STATUS_LETTERS = ['P', 'A', 'L', 'E', 'HD', 'R', 'CI', 'OFF', 'H', 'PL', 'UL', '-'];
+
+async function scenarioMyAttendancePayload() {
+    const s = 'my attendance: the employee never reads a raw database word';
+
+    const reqRows = await attendanceService.getHistory(
+        { id: null, employee_id: EMPLOYEES.req.id }, CO, PAST_M, PAST_Y
+    );
+    const byDate = {};
+    reqRows.forEach(r => { byDate[r.date] = r; });
+
+    check(s, 'one entry per calendar day of the month', reqRows.length, PAST_DIM);
+    check(s, 'newest first, the order the screen has always rendered',
+        [reqRows[0].date, reqRows[reqRows.length - 1].date], [P(PAST_DIM), P(1)]);
+
+    const strays = reqRows.filter(r => !STATUS_LETTERS.includes(r.status)).map(r => `${r.date}=${r.status}`);
+    check(s, 'every status is a resolved letter, never `pending` / `late` / `early_out`', strays, []);
+
+    // The two rows the employee used to read the database word off.
+    check(s, 'the held row reads E to the employee while the row still says pending',
+        [byDate[P(D_PENDING)].status, byDate[P(D_PENDING)].status_raw], ['E', 'pending']);
+    check(s, 'the late row reads L to the employee while the row still says late',
+        [byDate[P(D_LATE)].status, byDate[P(D_LATE)].status_raw], ['L', 'late']);
+
+    // Days with no attendance row at all. None of these existed in the payload before.
+    const sunday = ALL_DAYS.find(isSunday);
+    check(s, 'the weekoff is present and reads OFF',
+        [byDate[P(sunday)].status, byDate[P(sunday)].check_in], ['OFF', null]);
+    check(s, 'the company holiday is present and reads H',
+        [byDate[P(D_HOLIDAY)].status, byDate[P(D_HOLIDAY)].check_in], ['H', null]);
+    check(s, 'a bare past workday still reads A', byDate[P(WORKDAYS[4])].status, 'A');
+
+    const leaveRows = await attendanceService.getHistory(
+        { id: null, employee_id: EMPLOYEES.gen_pinned.id }, CO, PAST_M, PAST_Y
+    );
+    const leaveByDate = {};
+    leaveRows.forEach(r => { leaveByDate[r.date] = r; });
+    check(s, 'approved paid leave reads PL, not Absent', leaveByDate[P(D_PAID_LEAVE)].status, 'PL');
+    check(s, 'unpaid leave reads UL', leaveByDate[P(D_UNPAID_LEAVE)].status, 'UL');
+
+    // The future column, which had no row at all and so rendered as nothing.
+    const curRows = await attendanceService.getHistory(
+        { id: null, employee_id: EMPLOYEES.gen_pinned.id }, CO, CUR_M, CUR_Y
+    );
+    const future = curRows.filter(r => r.date > TODAY);
+    // A future weekoff is still OFF on the muster, so it is OFF here too; every other future
+    // day must be blank. Printing Absent against a day that has not happened is the bug.
+    const futureWorkdays = future.filter(r => dayNameOf(CUR_Y, CUR_M, parseInt(r.date.split('-')[2], 10)) !== 'Sunday');
+    check(s, 'every future date is present, and none of them reads Absent',
+        [future.length, futureWorkdays.every(r => r.status === '-')],
+        [CUR_DIM - CUR_D, true]);
+
+    // The hours column: `work_hours` is not a database column, so the screen printed
+    // "undefinedH" for every row it ever rendered.
+    check(s, 'a worked day carries real hours',
+        byDate[P(D_ONTIME)].work_hours, '9.1');
+    check(s, 'a day with no punch carries no hours',
+        byDate[P(sunday)].work_hours, null);
+    check(s, 'the day is labelled with the shift it was judged by',
+        byDate[P(D_ONTIME)].shift_code, 'RP General 09-18');
+
+    // Times are pre-formatted IST 'HH:mm'. A raw datetime handed to the browser is re-parsed in
+    // the VIEWER's timezone, which shifts the clock an employee outside IST reads.
+    check(s, 'arrival and departure are IST HH:mm, not a datetime the browser must parse',
+        [byDate[P(D_ONTIME)].in_time, byDate[P(D_ONTIME)].out_time], ['09:00', '18:05']);
+
+    // A 4-punch day: the departure is session 2's, and the hours are both sessions.
+    const splitRows = await attendanceService.getHistory(
+        { id: null, employee_id: EMPLOYEES.split.id }, CO, PAST_M, PAST_Y
+    );
+    const splitDay = splitRows.find(r => r.date === P(D_ONTIME));
+    check(s, 'a split shift spans both sessions',
+        [splitDay.status, splitDay.in_time, splitDay.out_time, splitDay.work_hours],
+        ['P', '09:00', '21:00', '8.0']);
+}
+
 const SCENARIOS = [
     scenarioPastMonthAgreement,
     scenarioCurrentMonthFutureDays,
     scenarioUnpinnedRowsRenderIdentically,
     scenarioEarlyOutPayrollWeight,
     scenarioDayDetailAgreesWithItself,
-    scenarioRequestStatesInTheDrawer
+    scenarioRequestStatesInTheDrawer,
+    scenarioMyAttendancePayload
 ];
 
 async function main() {

@@ -16,6 +16,57 @@ const StatCard = ({ label, value, icon: Icon, color, bg }) => (
     </div>
 );
 
+// /attendance/history returns the same resolved status LETTER the admin muster renders, decided
+// once in the backend by services/attendance/dayResolver.js. It used to return attendance.status
+// straight out of the database and this table printed the raw word, so an employee read `pending`
+// or `late` as their own attendance while their manager's grid said E or L for the same day.
+// Nothing here re-derives a status; this map is presentation only.
+const STATUS_META = {
+    P:   { label: 'Present',     badge: 'bg-emerald-50 text-emerald-600 border-emerald-100' },
+    R:   { label: 'Regularized', badge: 'bg-emerald-50 text-emerald-600 border-emerald-100' },
+    L:   { label: 'Late In',     badge: 'bg-amber-50 text-amber-600 border-amber-100' },
+    E:   { label: 'Early Out',   badge: 'bg-amber-50 text-amber-600 border-amber-100' },
+    HD:  { label: 'Half Day',    badge: 'bg-orange-50 text-orange-600 border-orange-100' },
+    CI:  { label: 'Checked In',  badge: 'bg-indigo-50 text-indigo-600 border-indigo-100' },
+    A:   { label: 'Absent',      badge: 'bg-rose-50 text-rose-600 border-rose-100' },
+    OFF: { label: 'Week Off',    badge: 'bg-slate-50 text-slate-500 border-slate-200' },
+    H:   { label: 'Holiday',     badge: 'bg-sky-50 text-sky-600 border-sky-100' },
+    PL:  { label: 'Paid Leave',  badge: 'bg-violet-50 text-violet-600 border-violet-100' },
+    UL:  { label: 'Unpaid Leave',badge: 'bg-violet-50 text-violet-600 border-violet-100' },
+    // '-' is the backend saying "nothing to judge yet": a date that has not happened, or today
+    // before its shift has run far enough past its end for a no-show to be settled. It must read
+    // as blank, never as Absent.
+    '-': { label: '\u2014',       badge: 'bg-slate-50 text-slate-300 border-slate-100' }
+};
+const statusMeta = (code) => STATUS_META[code] || { label: code || '\u2014', badge: 'bg-slate-50 text-slate-400 border-slate-100' };
+
+// 'YYYY-MM-DD' rendered without going through Date(), which would shift the day in a browser
+// west of UTC and print the wrong date against the right status.
+const formatDayMonth = (dateStr) => {
+    if (!dateStr) return '';
+    const [y, m, d] = String(dateStr).split('-').map(Number);
+    if (!y || !m || !d) return dateStr;
+    return new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString(undefined, {
+        day: '2-digit', month: 'short', timeZone: 'UTC'
+    });
+};
+
+// The four counters above the table. Every one of them is a plain fact about the payload the
+// backend already resolved - a letter count or a punch count - so nothing here can disagree with
+// the muster or invent a payroll weight. They were hardcoded to 22 / 18 / 2 / 8.4h before, shown
+// identically to every employee in the company.
+const summarise = (days) => {
+    const rows = Array.isArray(days) ? days : [];
+    const worked = rows.filter(r => r.work_hours != null).map(r => parseFloat(r.work_hours));
+    const totalHours = worked.reduce((a, b) => a + b, 0);
+    return {
+        workingDays: rows.filter(r => !['OFF', 'H', '-'].includes(r.status)).length,
+        attended: rows.filter(r => r.check_in).length,
+        late: rows.filter(r => r.status === 'L').length,
+        avgHours: worked.length ? `${(totalHours / worked.length).toFixed(1)}h` : '—'
+    };
+};
+
 
 
 const Attendance = () => {
@@ -33,6 +84,8 @@ const Attendance = () => {
         'January', 'February', 'March', 'April', 'May', 'June',
         'July', 'August', 'September', 'October', 'November', 'December'
     ];
+
+    const summary = summarise(history);
 
     useEffect(() => {
         fetchInitialData(currentMonth, currentYear);
@@ -121,14 +174,17 @@ const Attendance = () => {
             alert('No data available to export.');
             return;
         }
+        // Every day of the month is a row now, including the ones with no punch, so nothing here
+        // may assume item.check_in exists.
         const dataToExport = history.map((item, index) => ({
             "S.No.": index + 1,
-            "Date": new Date(item.check_in).toLocaleDateString(),
-            "Day": new Date(item.check_in).toLocaleDateString(undefined, { weekday: 'long' }),
-            "Status": item.status,
-            "Check-In": new Date(item.check_in).toLocaleTimeString(),
-            "Check-Out": item.check_out ? new Date(item.check_out).toLocaleTimeString() : '--:--',
-            "Work Hours": item.work_hours + " hrs"
+            "Date": item.date,
+            "Day": item.day_name || '',
+            "Status": statusMeta(item.status).label,
+            "Shift": item.shift_code || '',
+            "Check-In": item.in_time || '',
+            "Check-Out": item.out_time || '',
+            "Work Hours": item.work_hours ? `${item.work_hours} hrs` : ''
         }));
         exportToCSV(dataToExport, `Attendance_Report_${monthNames[currentMonth]}_${currentYear}.csv`);
     };
@@ -172,10 +228,10 @@ const Attendance = () => {
             {viewMode === 'self' ? (
                 <>
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6">
-                        <StatCard label="Total Work Days" value="22" icon={Calendar} color="text-indigo-600" bg="bg-indigo-50" />
-                        <StatCard label="Days Present" value="18" icon={CheckCircle} color="text-emerald-600" bg="bg-emerald-50" />
-                        <StatCard label="Late Entries" value="2" icon={Clock} color="text-orange-600" bg="bg-orange-50" />
-                        <StatCard label="Work Hours Avg" value="8.4h" icon={Activity} color="text-rose-600" bg="bg-rose-50" />
+                        <StatCard label="Working Days" value={summary.workingDays} icon={Calendar} color="text-indigo-600" bg="bg-indigo-50" />
+                        <StatCard label="Days Attended" value={summary.attended} icon={CheckCircle} color="text-emerald-600" bg="bg-emerald-50" />
+                        <StatCard label="Late Entries" value={summary.late} icon={Clock} color="text-orange-600" bg="bg-orange-50" />
+                        <StatCard label="Work Hours Avg" value={summary.avgHours} icon={Activity} color="text-rose-600" bg="bg-rose-50" />
                     </div>
 
                     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 md:gap-8">
@@ -249,28 +305,37 @@ const Attendance = () => {
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-50">
-                                            {history.map(item => (
-                                                <tr key={item.id} className="group hover:bg-slate-50 transition-colors">
-                                                    <td className="px-5 md:px-6 py-4">
-                                                        <p className="text-xs font-bold text-slate-700 leading-none mb-1">{new Date(item.check_in).toLocaleDateString(undefined, { day: '2-digit', month: 'short' })}</p>
-                                                        <p className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter opacity-70">{new Date(item.check_in).toLocaleDateString(undefined, { weekday: 'long' })}</p>
-                                                    </td>
-                                                    <td className="px-5 md:px-6 py-4">
-                                                        <span className={`px-2.5 py-1 rounded-full text-[8px] font-black uppercase tracking-widest border transition-colors ${item.status === 'present' ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : 'bg-orange-50 text-orange-600 border-orange-100'
-                                                            }`}>
-                                                            {item.status}
-                                                        </span>
-                                                    </td>
-                                                    <td className="px-5 md:px-6 py-4 text-[10px] md:text-xs font-bold text-slate-600">
-                                                        <span className="text-indigo-500">{new Date(item.check_in).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                                                        <span className="mx-1 text-slate-300">→</span>
-                                                        <span className="text-slate-500">{item.check_out ? new Date(item.check_out).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '--:--'}</span>
-                                                    </td>
-                                                    <td className="px-5 md:px-6 py-4 text-xs font-black text-slate-800 text-right italic">
-                                                        {item.work_hours}H
-                                                    </td>
-                                                </tr>
-                                            ))}
+                                            {history.map(item => {
+                                                const meta = statusMeta(item.status);
+                                                const isBlank = item.status === '-';
+                                                return (
+                                                    <tr key={item.date} className={`group hover:bg-slate-50 transition-colors ${isBlank ? 'opacity-50' : ''}`}>
+                                                        <td className="px-5 md:px-6 py-4">
+                                                            <p className="text-xs font-bold text-slate-700 leading-none mb-1">{formatDayMonth(item.date)}</p>
+                                                            <p className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter opacity-70">{item.day_name}</p>
+                                                        </td>
+                                                        <td className="px-5 md:px-6 py-4">
+                                                            <span className={`px-2.5 py-1 rounded-full text-[8px] font-black uppercase tracking-widest border transition-colors ${meta.badge}`}>
+                                                                {meta.label}
+                                                            </span>
+                                                        </td>
+                                                        <td className="px-5 md:px-6 py-4 text-[10px] md:text-xs font-bold text-slate-600">
+                                                            {item.in_time ? (
+                                                                <>
+                                                                    <span className="text-indigo-500">{item.in_time}</span>
+                                                                    <span className="mx-1 text-slate-300">→</span>
+                                                                    <span className="text-slate-500">{item.out_time || '--:--'}</span>
+                                                                </>
+                                                            ) : (
+                                                                <span className="text-slate-300">—</span>
+                                                            )}
+                                                        </td>
+                                                        <td className="px-5 md:px-6 py-4 text-xs font-black text-slate-800 text-right italic">
+                                                            {item.work_hours ? `${item.work_hours}H` : <span className="text-slate-300">—</span>}
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
                                         </tbody>
                                     </table>
                                 </div>

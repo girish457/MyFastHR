@@ -35,7 +35,9 @@ const {
     isNightShift,
     getLogicalDateStr,
     rowLogicalDate,
+    primaryDayLog,
     shiftForDay,
+    dayNameForDateStr,
     resolveNoLogStatus,
     resolveDayStatus,
     resolveDayStatusDetail,
@@ -747,13 +749,68 @@ class AttendanceService {
         return await attendanceRepository.getCurrentStatus(empId, companyId);
     }
 
+    /**
+     * "My Attendance" - the screen the EMPLOYEE reads about themselves.
+     *
+     * This was the one read path never routed through the resolver. It returned
+     * attendanceRepository.getHistory() verbatim - a `SELECT *` with no shift resolution and no
+     * status resolution - and the screen printed attendance.status to the person: an employee
+     * saw the literal word `pending` or `late` as their own attendance while the admin muster
+     * showed E / L for the same row. Days with no punch simply did not exist in the payload, so
+     * the screen had no concept of a weekoff, a holiday, an approved leave or a future date and
+     * silently showed nothing for all of them.
+     *
+     * It is now the fifth consumer of buildAttendanceDaySheet, so it answers with the same
+     * letter the muster, the history sheet, the date-wise screen and the day-detail drawer do -
+     * asserted cell for cell by scripts/replayReadPath.js.
+     *
+     * Shape: one entry per calendar day of the month, newest first (the order the screen has
+     * always rendered). Each entry still carries the day's representative attendance row -
+     * id / check_in / check_out / punch_source - so the other consumers of this endpoint that
+     * read those fields and skip entries without a check_in are unaffected. `status` is now the
+     * resolved letter; `status_raw` keeps the untouched database word for anyone who needs it.
+     *
+     * `extended` is untouched: RegularizationView renders its own calendar from the raw rows
+     * plus the overlays, and changing that payload is not this change's job.
+     */
     async getHistory(user, companyId, month, year, extended = false) {
         const empId = await this.getEmployeeId(user.id, companyId, user.employee_id);
-        const attendance = await attendanceRepository.getHistory(empId, companyId, month, year);
 
         if (!extended) {
-            return attendance;
+            const m = parseInt(month, 10);
+            const y = parseInt(year, 10);
+            const dim = new Date(y, m, 0).getDate();
+            const pad2 = n => String(n).padStart(2, '0');
+            const sheet = await this.buildAttendanceDaySheet(
+                companyId, empId, `${y}-${pad2(m)}-01`, `${y}-${pad2(m)}-${pad2(dim)}`
+            );
+
+            return sheet.map(day => {
+                const row = day.primary || {};
+                return {
+                    // The day itself, judged once, the same way every other screen judges it.
+                    date: day.date,
+                    day_name: day.day_name,
+                    status: day.status,
+                    status_raw: day.primary ? (day.primary.status ?? null) : null,
+                    shift_code: day.shift_code,
+                    work_hours: day.workedMs > 0 ? (day.workedMs / 3600000).toFixed(1) : null,
+                    // IST 'HH:mm', already formatted - the screen must not re-parse a datetime
+                    // in the viewer's timezone.
+                    in_time: day.in_time,
+                    out_time: day.out_time,
+
+                    // The row that day is about, or nulls. Kept at the top level because this is
+                    // the shape the endpoint has always had.
+                    id: row.id ?? null,
+                    check_in: row.check_in ?? null,
+                    check_out: row.check_out ?? null,
+                    punch_source: row.punch_source ?? null
+                };
+            }).reverse();
         }
+
+        const attendance = await attendanceRepository.getHistory(empId, companyId, month, year);
 
         const leaves = await db('leaves')
             .where({ employee_id: empId, company_id: companyId })
@@ -1529,7 +1586,22 @@ class AttendanceService {
         return { message: 'Override applied successfully' };
     }
 
-    async getEmployeeAttendanceHistory(companyId, employeeId, from, to) {
+    /**
+     * One employee, one date range, one judged day per date. The single source the
+     * employee-facing "My Attendance" screen and the admin history sheet both render.
+     *
+     * This body was getEmployeeAttendanceHistory's. It was lifted out when the employee's own
+     * screen became the fifth consumer of the resolver, because the alternative - a second copy
+     * of these eight queries and this day loop - is precisely how the four admin screens drifted
+     * apart in the first place. Two screens over one employee-month now cannot disagree: there
+     * is one loop, and the callers only choose which fields to render.
+     *
+     * Returns, per date ascending: the resolved status LETTER (never the raw database word),
+     * the name of the shift the day was judged by, which of the day's rows represents the day,
+     * and how long was actually worked. Judgment comes from dayResolver; everything here is
+     * queries and marshalling.
+     */
+    async buildAttendanceDaySheet(companyId, employeeId, from, to) {
         // Adjust the query range slightly to capture crossover night shifts
         const nextToDate = new Date(new Date(to).getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
         const attendance = await db('attendance')
@@ -1620,24 +1692,64 @@ class AttendanceService {
             // This sheet used to read attendance.status straight out of the row while the muster
             // recomputed the same day, so a day could read P here and L/HD/E on the admin grid.
             // Both now go through resolveDayStatus.
-            const historyStatus = resolveDayStatus(dayLogs, shift, rules, {
+            const punchedStatus = resolveDayStatus(dayLogs, shift, rules, {
                 regularization: regularizedDays.has(dateStr),
                 earlyOutRequest: earlyOutDays.has(dateStr),
                 todayStr,
                 now
-            }) || resolveNoLogStatus(dateStr, { weekoffs, holidays, leaves, shift, todayStr, now }).status;
+            });
+            // null means "this day has no attendance at all" - the cue to fall through to the
+            // weekoff -> holiday -> leave -> absent/blank chain, which is where OFF, H, PL, UL
+            // and the deliberately blank future date come from.
+            const historyStatus = punchedStatus ||
+                resolveNoLogStatus(dateStr, { weekoffs, holidays, leaves, shift, todayStr, now }).status;
+
+            // Which row IS the day - a closed row over an abandoned duplicate, an admin's manual
+            // edit over any punch. The same rule the letter above was decided by, so the hours
+            // and the times an employee reads describe the row the letter is about.
+            const primary = primaryDayLog(dayLogs, shift);
+            const reqPunches = parseInt(shift?.total_punches_required || shift?.shift_total_punches || 2);
+            const primaryMs = primary && primary.check_out
+                ? (new Date(primary.check_out) - new Date(primary.check_in))
+                : 0;
+            const workedMs = reqPunches === 4 ? (s1Ms + s2Ms) : primaryMs;
+
+            // The day's arrival and departure as IST wall-clock 'HH:mm'. A raw DB datetime
+            // handed to the browser is parsed in the VIEWER's timezone, so an employee outside
+            // IST reads a shifted time against a correct status. On a 4-punch day the departure
+            // is session 2's, which is why it is not simply the primary row's check_out.
+            const lastOut = dayLogs[dayLogs.length - 1] ? safeFormatTime(dayLogs[dayLogs.length - 1].check_out) : null;
 
             sheet.push({
                 date: dateStr,
-                shift_code: shift?.name || defaultShiftName,
+                day_name: dayNameForDateStr(dateStr),
                 status: historyStatus,
+                shift_code: shift?.name || defaultShiftName,
+                primary,
                 first_in: dayLogs[0] ? safeFormatTime(dayLogs[0].check_in) : null,
-                last_out: dayLogs[dayLogs.length - 1] ? safeFormatTime(dayLogs[dayLogs.length - 1].check_out) : null,
-                session1: s1Ms > 0 ? `${(s1Ms / 3600000).toFixed(1)}h` : '0.0h',
-                session2: s2Ms > 0 ? `${(s2Ms / 3600000).toFixed(1)}h` : '0.0h'
+                last_out: lastOut,
+                in_time: primary ? safeFormatTime(primary.check_in) : null,
+                out_time: reqPunches === 4 ? lastOut : (primary ? safeFormatTime(primary.check_out) : null),
+                s1Ms,
+                s2Ms,
+                workedMs
             });
         }
         return sheet;
+    }
+
+    // The admin history sheet. Unchanged output; the judgment now comes from the shared sheet.
+    async getEmployeeAttendanceHistory(companyId, employeeId, from, to) {
+        const sheet = await this.buildAttendanceDaySheet(companyId, employeeId, from, to);
+        return sheet.map(day => ({
+            date: day.date,
+            shift_code: day.shift_code,
+            status: day.status,
+            first_in: day.first_in,
+            last_out: day.last_out,
+            session1: day.s1Ms > 0 ? `${(day.s1Ms / 3600000).toFixed(1)}h` : '0.0h',
+            session2: day.s2Ms > 0 ? `${(day.s2Ms / 3600000).toFixed(1)}h` : '0.0h'
+        }));
     }
 
     async getDateWiseAttendance(companyId, date) {
