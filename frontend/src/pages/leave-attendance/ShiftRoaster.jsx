@@ -134,6 +134,18 @@ const ShiftRoaster = () => {
     const [saveLoading, setSaveLoading] = useState(false);
     const [errorMsg, setErrorMsg] = useState('');
     const [successMsg, setSuccessMsg] = useState('');
+    // The backend refuses a backdated assignment unless the caller confirms it (assignShift,
+    // allow_backdate), because re-resolving days already worked rewrites their muster status
+    // and the payroll computed from it. Fixing a past cell is exactly what this grid is for -
+    // rotations are routinely keyed in after the punches - so the first Save on a past date
+    // shows the warning below and the second one sends the confirmation. Same contract as
+    // ShiftOverride.jsx, done inline because this drawer has no confirm modal of its own.
+    const [backdateWarningShown, setBackdateWarningShown] = useState(false);
+
+    const isBackdated = (dateStr) => {
+        const todayStr = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+        return !!dateStr && dateStr < todayStr;
+    };
 
     useEffect(() => {
         fetchRoster();
@@ -267,6 +279,7 @@ const ShiftRoaster = () => {
         setIsPermanent(false);
         setErrorMsg('');
         setSuccessMsg('');
+        setBackdateWarningShown(false);
         setDrawerOpen(true);
     };
 
@@ -274,6 +287,13 @@ const ShiftRoaster = () => {
         e.preventDefault();
         if (!selectedShiftId) {
             setErrorMsg('Please select a shift');
+            return;
+        }
+
+        // First Save on a past From Date only raises the warning; the admin has to press
+        // Save again to confirm. Editing the date withdraws the confirmation (see onChange).
+        if (isBackdated(fromDate) && !backdateWarningShown) {
+            setBackdateWarningShown(true);
             return;
         }
         
@@ -286,7 +306,9 @@ const ShiftRoaster = () => {
                 employee_ids: [selectedCell.employee.id],
                 shift_id: parseInt(selectedShiftId),
                 from_date: fromDate,
-                to_date: isPermanent ? null : toDate
+                to_date: isPermanent ? null : toDate,
+                // Only ever true after the warning above was shown and Save pressed again.
+                allow_backdate: backdateWarningShown
             });
             
             setSuccessMsg('Shift assigned successfully!');
@@ -623,6 +645,11 @@ const ShiftRoaster = () => {
                                         {successMsg}
                                     </div>
                                 )}
+                                {backdateWarningShown && (
+                                    <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-amber-700 text-[10px] font-black uppercase tracking-wider leading-relaxed">
+                                        From Date {fromDate} is in the past. Attendance already recorded from that date will be re-evaluated against this shift, which can change days that are already settled. Press Save again to apply anyway.
+                                    </div>
+                                )}
 
                                 <div className="space-y-2">
                                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Select Shift Type</label>
@@ -660,7 +687,7 @@ const ShiftRoaster = () => {
                                         <input 
                                             type="date" 
                                             value={fromDate}
-                                            onChange={(e) => setFromDate(e.target.value)}
+                                            onChange={(e) => { setFromDate(e.target.value); setBackdateWarningShown(false); }}
                                             className="w-full h-11 bg-slate-50 border border-slate-200 rounded-xl px-4 text-xs font-bold text-slate-700 outline-none focus:border-indigo-500"
                                             required
                                         />
@@ -699,7 +726,7 @@ const ShiftRoaster = () => {
                                 >
                                     {saveLoading ? (
                                         <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                                    ) : 'Save Override'}
+                                    ) : (backdateWarningShown ? 'Yes, Apply To Past Dates' : 'Save Override')}
                                 </button>
                             </div>
                         </motion.div>
