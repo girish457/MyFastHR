@@ -1664,7 +1664,7 @@ const ShiftManagement = () => {
                     </motion.div>
                 )}
             </AnimatePresence>
-            <style jsx>{`
+            <style>{`
                 .custom-scrollbar::-webkit-scrollbar { width: 4px; }
                 .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
                 .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 4px; }

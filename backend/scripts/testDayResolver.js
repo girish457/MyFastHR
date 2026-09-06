@@ -540,9 +540,25 @@ group('status vocabulary mapping');
     eq('undefined -> A', R.mapDbStatusToFrontend(undefined), 'A');
 
     [['P', 'present'], ['A', 'absent'], ['OFF', 'off'], ['R', 'regularized'], ['HD', 'half-day'],
-     ['CI', 'present'], ['E', 'early_out'], ['EO', 'early_out'], ['L', 'present']]
+     ['CI', 'present'], ['E', 'early_out'], ['EO', 'early_out']]
         .forEach(([ui, db]) => eq(`ui '${ui}' -> ${db}`, R.mapFrontendStatusToDb(ui), db));
     eq('nothing -> absent', R.mapFrontendStatusToDb(null), 'absent');
+
+    // No silent default. A caller sending the full word "Absent" instead of the letter "A" used
+    // to be quietly written as Present - the opposite of what was asked, with nothing to notice
+    // it by. And L has no honest write target at all: Late is derived from the punch time
+    // against the shift, never a status this path stores.
+    const rejects = (label, input) => {
+        try {
+            R.mapFrontendStatusToDb(input);
+            eq(label, 'did not throw', 'threw');
+        } catch (e) {
+            eq(label, true, /Unrecognized manual attendance status/.test(e.message));
+        }
+    };
+    rejects('an unrecognized word is rejected, not silently written as present', 'Absent');
+    rejects('L has no write target and is rejected', 'L');
+    rejects('gibberish is rejected', 'gibberish');
 }
 
 group('sentence fragments');

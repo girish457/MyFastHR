@@ -300,7 +300,12 @@ function mapFrontendStatusToDb(status) {
     if (s === 'HD') return 'half-day';
     if (s === 'CI') return 'present';
     if (s === 'E' || s === 'EO') return 'early_out';
-    return 'present';
+    // No silent default. This used to fall through to 'present' for anything unrecognized,
+    // which is how a caller sending the full word "Absent" instead of the letter "A" ended up
+    // marking someone Present - the opposite of what was asked, with no error to notice it by.
+    // L is deliberately NOT accepted here: Late is derived from comparing a punch time against
+    // the shift, never a status this write path stores, so there is no honest way to "set" it.
+    throw new Error(`Unrecognized manual attendance status: "${status}"`);
 }
 
 // The single place where a worked day becomes a status letter.

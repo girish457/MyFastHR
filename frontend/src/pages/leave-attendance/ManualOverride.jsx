@@ -919,8 +919,8 @@ const EmployeeWiseTab = ({ shifts, setLoading, loading, setSuccess, setError }) 
                                         <td className="px-6 py-4 text-[11px] font-medium text-slate-500">{row.session1 || '0.0h'}</td>
                                         <td className="px-6 py-4 text-[11px] font-medium text-slate-500">{row.session2 || '0.0h'}</td>
                                         <td className="px-6 py-4 text-right">
-                                            <select 
-                                                value={row.status} 
+                                            <select
+                                                value={row.status}
                                                 onChange={(e) => updateStatus(row.date, e.target.value)}
                                                 className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none focus:border-indigo-300"
                                             >
@@ -929,6 +929,13 @@ const EmployeeWiseTab = ({ shifts, setLoading, loading, setSuccess, setError }) 
                                                 <option value="HD">HD</option>
                                                 <option value="OFF">OFF</option>
                                                 <option value="R">R</option>
+                                                <option value="E">E</option>
+                                                <option value="CI">CI</option>
+                                                {/* L/H/PL/UL are computed, not a status this screen can write - shown so the
+                                                    dropdown never silently mismatches into displaying P for one of them. */}
+                                                {!['P', 'A', 'HD', 'OFF', 'R', 'E', 'CI'].includes(row.status) && (
+                                                    <option value={row.status} disabled>{row.status}</option>
+                                                )}
                                             </select>
                                         </td>
                                     </tr>
@@ -1182,8 +1189,8 @@ const DateWiseTab = ({ setLoading, loading, setSuccess, setError }) => {
                                         <td className="px-6 py-4 text-[11px] font-medium text-slate-500">{row.session1 || '0.0h'}</td>
                                         <td className="px-6 py-4 text-[11px] font-medium text-slate-500">{row.session2 || '0.0h'}</td>
                                         <td className="px-6 py-4 text-right">
-                                            <select 
-                                                value={row.status} 
+                                            <select
+                                                value={row.status}
                                                 onChange={(e) => updateStatus(row.id, e.target.value)}
                                                 className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none focus:border-indigo-300"
                                             >
@@ -1192,6 +1199,13 @@ const DateWiseTab = ({ setLoading, loading, setSuccess, setError }) => {
                                                 <option value="HD">HD</option>
                                                 <option value="OFF">OFF</option>
                                                 <option value="R">R</option>
+                                                <option value="E">E</option>
+                                                <option value="CI">CI</option>
+                                                {/* L/H/PL/UL are computed, not a status this screen can write - shown so the
+                                                    dropdown never silently mismatches into displaying P for one of them. */}
+                                                {!['P', 'A', 'HD', 'OFF', 'R', 'E', 'CI'].includes(row.status) && (
+                                                    <option value={row.status} disabled>{row.status}</option>
+                                                )}
                                             </select>
                                         </td>
                                     </tr>
