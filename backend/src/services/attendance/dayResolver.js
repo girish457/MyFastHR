@@ -576,7 +576,7 @@ function calculateSplitShiftStatus(dayLogs, shift, rules, now) {
         let s1PunchText = 'S1: Missed';
         let s1Active = false;
 
-        const s1Log = s1Logs[0];
+        const s1Log = s1Logs.find(l => l.check_out) || s1Logs[0];
         if (s1Log) {
             const inMins = dateToMins(s1Log.check_in);
             s1Late = inMins > (s1Start + grace1In);
@@ -604,7 +604,7 @@ function calculateSplitShiftStatus(dayLogs, shift, rules, now) {
         let s2PunchText = 'S2: Missed';
         let s2Active = false;
 
-        const s2Log = s2Logs[0];
+        const s2Log = s2Logs.find(l => l.check_out) || s2Logs[0];
         if (s2Log) {
             const inMins = dateToMins(s2Log.check_in);
             s2Late = inMins > (s2Start + grace2In);
@@ -663,8 +663,15 @@ function calculateSplitShiftStatus(dayLogs, shift, rules, now) {
             punch_count: dayLogs.reduce((acc, log) => acc + (log.check_in ? 1 : 0) + (log.check_out ? 1 : 0), 0)
         };
     } else {
-        // Standard 2-punch shift
-        const log = dayLogs[0];
+        // Standard 2-punch shift.
+        //
+        // primaryDayLog, NOT dayLogs[0]. resolveDayStatusDetail already picks the primary row
+        // for its own checks and then calls this function for the letter itself - so taking
+        // [0] here quietly overrode that choice and judged the day by the abandoned duplicate
+        // anyway. Measured on Hotel Highway King employee 2549, 2026-08-21: an entry_request row
+        // at 06:18:03 that nobody ever closed sat one second in front of the real biometric
+        // row 06:18:04 -> 16:13:42, and the day a man worked 9h55m of read Absent.
+        const log = primaryDayLog(dayLogs, shift);
         if (!log) {
             return { status: 'A', explanation: 'Missed', punch_count: 0 };
         }

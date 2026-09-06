@@ -642,6 +642,44 @@ group('every letter x every no-log overlay, exhaustively');
 }
 
 // =============================================================================================
+group('an abandoned duplicate row never decides the day');
+{
+    // The shape that broke it in production: an entry_request row written one second BEFORE the
+    // real biometric row, never closed, and sorted first because dayLogs is ascending by
+    // check_in. Hotel Highway King employee 2549 on 2026-08-21. resolveDayStatusDetail picked the
+    // right row via primaryDayLog and then handed ALL the logs to calculateSplitShiftStatus,
+    // which took dayLogs[0] again - so the day a man worked 9h55m of was judged by the row
+    // nobody ever closed, and read Absent.
+    const abandoned = { id: 1, check_in: at(D_PAST, '06:18'), check_out: null, status: 'present', punch_source: 'entry_request' };
+    const real = { id: 2, check_in: at(D_PAST, '06:19'), check_out: at(D_PAST, '16:13'), status: 'pending', punch_source: 'biometric' };
+    const SHIFT_0600 = Object.assign({}, SHIFT_STANDARD, { start_time: '06:00', end_time: '16:00', grace_period: 15 });
+
+    const dup = R.calculateSplitShiftStatus([abandoned, real], SHIFT_0600, {}, NOW);
+    eq('the closed row decides the letter, not the open duplicate in front of it', dup.status, 'L');
+    eq('and the sentence describes the closed row', /06:19 - 16:13/.test(dup.explanation), true);
+
+    // The same day with only the real row must reach the identical answer - the duplicate must
+    // make no difference at all.
+    const alone = R.calculateSplitShiftStatus([real], SHIFT_0600, {}, NOW);
+    eq('a lone closed row answers the same', [alone.status, alone.explanation], [dup.status, dup.explanation]);
+
+    // ... and a day that really was only an unclosed punch must still be absent.
+    const openOnly = R.calculateSplitShiftStatus([abandoned], SHIFT_0600, {}, NOW);
+    eq('a genuinely unclosed past day is still not Present', openOnly.status !== 'P' && openOnly.status !== 'L', true);
+
+    // Through the top-level entry point the whole way, which is what the screens call.
+    const detail = R.resolveDayStatusDetail([abandoned, real], SHIFT_0600, {}, { explain: true, todayStr: TODAY_STR, now: NOW });
+    eq('resolveDayStatusDetail agrees end to end', detail.status, 'L');
+
+    // Within one session of a 4-punch day the same rule holds.
+    const s1open = { id: 3, check_in: at(D_PAST, '09:00'), check_out: null, status: 'present' };
+    const s1real = { id: 4, check_in: at(D_PAST, '09:01'), check_out: at(D_PAST, '13:00'), status: 'present' };
+    const s2real = { id: 5, check_in: at(D_PAST, '17:00'), check_out: at(D_PAST, '21:00'), status: 'present' };
+    const split = R.calculateSplitShiftStatus([s1open, s1real, s2real], SHIFT_SPLIT, {}, NOW);
+    eq('a duplicate inside session 1 does not cost the whole session', split.status, 'P');
+}
+
+// =============================================================================================
 console.log('');
 if (failures.length) {
     console.log(`${passed}/${passed + failures.length} assertions passed. ${failures.length} FAILED:\n`);
