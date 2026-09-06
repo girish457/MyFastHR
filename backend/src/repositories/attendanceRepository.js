@@ -235,10 +235,15 @@ class AttendanceRepository {
             .whereRaw('(MONTH(l.start_date) = ? OR MONTH(l.end_date) = ?) AND (YEAR(l.start_date) = ? OR YEAR(l.end_date) = ?)', [month, month, year, year])
             .select('l.employee_id', 'l.start_date', 'l.end_date', 'l.days', 'l.leave_type_id', 'lt.name as leave_type_name');
 
-        // 4. Get approved entry/exit requests for these employees (specifically early_out)
+        // 4. Get entry/exit requests for these employees (specifically early_out), in EVERY
+        // decision state. This used to filter to status='approved', which meant the muster
+        // could not tell a refused early departure from one nobody had looked at yet - both
+        // simply were not there, and both banked a full present day in stats.P, exactly like
+        // an approved one. getMatrix still treats only the approved rows as "an approver
+        // settled this day"; the rest are read for their payroll weight alone.
         const entryRequests = await db('attendance_entry_requests')
             .whereIn('employee_id', employeeIds)
-            .where({ request_type: 'early_out', status: 'approved' })
+            .where({ request_type: 'early_out' })
             .whereRaw('MONTH(date) = ? AND YEAR(date) = ?', [month, year])
             .select('employee_id', 'date', 'request_type', 'status');
 

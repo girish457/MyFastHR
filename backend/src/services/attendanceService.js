@@ -140,6 +140,106 @@ function shiftForDay(dayLogs, shiftsById, rosterAssignment, fallbackShift = null
     return pinnedShiftForDay(dayLogs, shiftsById) || rosterAssignment || fallbackShift || null;
 }
 
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+// The weekday of a 'YYYY-MM-DD' string. Built at UTC noon so no server timezone can push the
+// date onto its neighbour, which is the difference between an employee's weekoff landing on
+// Sunday and landing on Saturday.
+function dayNameForDateStr(dateStr) {
+    if (!dateStr) return null;
+    const [y, m, d] = String(dateStr).split('-').map(Number);
+    if (!y || !m || !d) return null;
+    return WEEKDAY_NAMES[new Date(Date.UTC(y, m - 1, d, 12)).getUTCDay()];
+}
+
+function istTodayStr() {
+    return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+}
+
+// Has TODAY's shift run far enough past its end that a no-show is settled? Until it has, the
+// muster leaves the cell blank rather than accusing someone who is still inside their window.
+function shiftDayIsTerminated(dateStr, shift) {
+    if (!shift) return false;
+    const startStr = shift.start_time || shift.shift_start || '09:00';
+    const endStr = shift.end_time || shift.shift_end || '18:00';
+    const [sH, sM] = String(startStr).split(':').map(Number);
+    const [eH, eM] = String(endStr).split(':').map(Number);
+    if ([sH, sM, eH, eM].some(n => Number.isNaN(n))) return false;
+
+    const at = (h, m) => new Date(`${dateStr}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00+05:30`);
+    const start = at(sH, sM);
+    let end = at(eH, eM);
+    if (end < start) end = new Date(end.getTime() + 24 * 60 * 60 * 1000);
+
+    const terminateHour = parseInt(shift.terminate_hour || 2);
+    return new Date() > new Date(end.getTime() + terminateHour * 60 * 60 * 1000);
+}
+
+// The single place where a day with NO attendance at all becomes a status letter.
+//
+// The muster had this chain inline while the history sheet and the date-wise screen ran
+// `resolveDayStatus(...) || 'A'` with no chain whatsoever. Measured on one employee's
+// November, 27 of 30 cells disagreed because of it: five Sundays the grid drew OFF, the one
+// company holiday it drew H, and twenty-one days that had not happened yet and that the grid
+// left blank all printed Absent on the history sheet and the date-wise screen. An approved
+// leave read A there against the grid's PL by the same route. All three call this now.
+//
+// Returns { status, amount }. `amount` is what the day is worth to the stat it lands in and
+// is only ever 0.5, for a half-day leave. '-' means "nothing to say about this day yet" -
+// a future date, or today before its shift can be judged - and counts towards nothing.
+function resolveNoLogStatus(dateStr, ctx = {}) {
+    const {
+        weekoffs = [],
+        holidays = [],
+        leaves = [],
+        shift = null,
+        todayStr = istTodayStr()
+    } = ctx;
+
+    if (!dateStr) return { status: '-', amount: 0 };
+
+    // 1. Week off
+    const dayName = dayNameForDateStr(dateStr);
+    if (dayName && weekoffs.includes(dayName)) return { status: 'OFF', amount: 1 };
+
+    // 2. Holiday. The muster compared only the day-of-month, which is correct exactly as long
+    //    as `holidays` was fetched month-scoped - a precondition that is invisible at the call
+    //    site and that two of the three callers here do not satisfy. Compare the whole date.
+    if (holidays.some(h => toLocalYMD(h.date) === dateStr)) return { status: 'H', amount: 1 };
+
+    // 3. Approved leave
+    const onLeave = leaves.find(l => {
+        const from = toLocalYMD(l.start_date);
+        const to = toLocalYMD(l.end_date);
+        return from && to && dateStr >= from && dateStr <= to;
+    });
+    if (onLeave) {
+        const typeName = String(onLeave.leave_type_name || '').toLowerCase();
+        const isPaid = !typeName.includes('unpaid') && !typeName.includes('lop');
+        const isHalfDay = Number(onLeave.days) === 0.5 &&
+            toLocalYMD(onLeave.start_date) === toLocalYMD(onLeave.end_date);
+        return { status: isPaid ? 'PL' : 'UL', amount: isHalfDay ? 0.5 : 1 };
+    }
+
+    // 4. Absent - but only once the day is genuinely over.
+    if (dateStr < todayStr) return { status: 'A', amount: 1 };
+    if (dateStr > todayStr) return { status: '-', amount: 0 };
+    return shiftDayIsTerminated(dateStr, shift) ? { status: 'A', amount: 1 } : { status: '-', amount: 0 };
+}
+
+const STATUS_LABEL = {
+    P: 'Present', A: 'Absent', L: 'Late In', E: 'Early Out', HD: 'Half Day',
+    R: 'Regularized', CI: 'Checked In', OFF: 'Week Off', H: 'Holiday'
+};
+
+// When the resolved letter overrides what the punches alone compute to, say why - and keep the
+// punch-level sentence after it, because that is what the drawer exists to show.
+function overrideExplanation(status, reason, base) {
+    const label = STATUS_LABEL[status] || status;
+    const detail = base && base.explanation ? ` | ${base.explanation}` : '';
+    return `${label} (${reason})${detail}`;
+}
+
 // The single place where a worked day becomes a status letter.
 //
 // The muster recomputed this inline, the history sheet trusted attendance.status untouched, and
@@ -149,28 +249,56 @@ function shiftForDay(dayLogs, shiftsById, rosterAssignment, fallbackShift = null
 //
 // `resolvedShift` must already be the shift the day was RECORDED under (see shiftForDay), not
 // whatever the roster says today. Returns null when the day has no attendance at all, which is
-// the caller's cue to fall through to weekoff / holiday / leave / absent.
+// the caller's cue to fall through to resolveNoLogStatus.
 function resolveDayStatus(dayLogs, resolvedShift, rules, ctx = {}) {
-    const { regularization = false, earlyOutRequest = false } = ctx;
+    return resolveDayStatusDetail(dayLogs, resolvedShift, rules, ctx).status;
+}
+
+// The same decision, plus the sentence that explains it.
+//
+// The day-detail drawer overwrote only `splitShiftDetails.status` from this resolver and left
+// the sentence calculateSplitShiftStatus had produced, so the panel contradicted itself in two
+// adjacent fields: a rejected early-out read status E beside "S1: On-Time (06:00 - 11:00)".
+// The letter and the text come from the same place now, so they cannot drift apart.
+//
+// Pass ctx.explain = true to build the sentence. The muster throws it away and calls this once
+// per employee per day, so it stays off by default and the punch-level computation is only
+// done when a branch actually needs the letter from it.
+function resolveDayStatusDetail(dayLogs, resolvedShift, rules, ctx = {}) {
+    const { regularization = false, earlyOutRequest = false, explain = false } = ctx;
 
     if (!dayLogs || dayLogs.length === 0) {
-        if (regularization) return 'R';
-        if (earlyOutRequest) return 'E';
-        return null;
+        if (regularization) return { status: 'R', explanation: explain ? 'Regularized (approved, no punch recorded)' : null };
+        if (earlyOutRequest) return { status: 'E', explanation: explain ? 'Early Out (request approved, no punch recorded)' : null };
+        return { status: null, explanation: null };
     }
 
     const shift = resolvedShift || {};
     const firstLog = primaryDayLog(dayLogs, shift);
     const dbStatus = firstLog.status ? String(firstLog.status).toLowerCase() : '';
 
+    // What the punches alone say. Memoised: several branches need only the letter, the rest
+    // need it only to write the sentence.
+    let computed;
+    const base = () => (computed || (computed = calculateSplitShiftStatus(dayLogs, shift, rules)));
+
+    // A resolved letter plus the reason it overrode `base`. When the two already agree, the
+    // punch-level sentence is the better explanation and is kept as-is.
+    const decide = (status, reason) => {
+        if (!explain) return { status, explanation: null };
+        const b = base();
+        if (b && b.status === status) return { status, explanation: b.explanation };
+        return { status, explanation: overrideExplanation(status, reason, b) };
+    };
+
     const logCheckInDate = dbDateToUTC(firstLog.check_in);
     const logCheckInYMD = logCheckInDate ? logCheckInDate.toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' }) : null;
-    const curTodayYMD = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+    const curTodayYMD = istTodayStr();
     const isTodayActive = (logCheckInYMD === curTodayYMD);
 
     if (dbStatus === 'pending') {
-        if (firstLog.check_out) return calculateSplitShiftStatus(dayLogs, shift, rules).status;
-        return isTodayActive ? 'CI' : 'A';
+        if (firstLog.check_out) return decide(base().status, 'awaiting approval');
+        return decide(isTodayActive ? 'CI' : 'A', 'awaiting approval, no punch out');
     }
 
     if (!firstLog.check_out && isTodayActive &&
@@ -178,45 +306,82 @@ function resolveDayStatus(dayLogs, resolvedShift, rules, ctx = {}) {
         firstLog.punch_source !== 'manual_override' &&
         firstLog.punch_source !== 'regularization' &&
         dbStatus !== 'regularized' && dbStatus !== 'r' && !regularization) {
-        return 'CI';
+        return decide('CI', 'no punch out yet');
     }
 
     if (firstLog.punch_source === 'manual' || firstLog.punch_source === 'manual_override') {
-        return mapDbStatusToFrontend(dbStatus);
+        return decide(mapDbStatusToFrontend(dbStatus), 'manual override by an admin');
     }
 
     if (regularization || dbStatus === 'regularized' || dbStatus === 'r' || firstLog.punch_source === 'regularization') {
-        return 'R';
+        return decide('R', 'regularization approved');
     }
 
     // A settled decision an approver made. The row's own status is the answer; recomputing it
     // from the clock is how an approved late_in still drew E in the day-detail drawer.
     if (firstLog.punch_source === 'entry_request' || earlyOutRequest) {
-        if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd') return 'HD';
-        if (dbStatus === 'late-in' || dbStatus === 'late_in' || dbStatus === 'late' || dbStatus === 'l') return 'L';
-        if (dbStatus === 'present' || dbStatus === 'p') return 'P';
-        if (dbStatus === 'absent' || dbStatus === 'a') return 'A';
-        return 'E';
+        const reason = 'approver decision applied';
+        if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd') return decide('HD', reason);
+        if (dbStatus === 'late-in' || dbStatus === 'late_in' || dbStatus === 'late' || dbStatus === 'l') return decide('L', reason);
+        if (dbStatus === 'present' || dbStatus === 'p') return decide('P', reason);
+        if (dbStatus === 'absent' || dbStatus === 'a') return decide('A', reason);
+        return decide('E', reason);
     }
 
-    if (dbStatus === 'absent' || dbStatus === 'a') return 'A';
-    if (dbStatus === 'off') return 'OFF';
-    if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd' || dbStatus === 'short') return 'HD';
-    if (dbStatus === 'early-out' || dbStatus === 'early_out' || dbStatus === 'eo' || dbStatus === 'e') return 'E';
-    if (shift.is_flexi) return 'P';
+    const asRecorded = `recorded as ${dbStatus || 'unknown'}`;
+    if (dbStatus === 'absent' || dbStatus === 'a') return decide('A', asRecorded);
+    if (dbStatus === 'off') return decide('OFF', asRecorded);
+    if (dbStatus === 'half-day' || dbStatus === 'half_day' || dbStatus === 'hd' || dbStatus === 'short') return decide('HD', asRecorded);
+    if (dbStatus === 'early-out' || dbStatus === 'early_out' || dbStatus === 'eo' || dbStatus === 'e') return decide('E', asRecorded);
+    if (shift.is_flexi) return decide('P', 'flexi shift, judged on hours worked');
 
-    return calculateSplitShiftStatus(dayLogs, shift, rules).status;
+    const b = base();
+    return { status: b.status, explanation: explain ? b.explanation : null };
+}
+
+// What an Early Out day is worth to payroll.
+//
+// payrollService computes paidDays = stats.P + stats.L + stats.OFF + stats.H + stats.PL, so a
+// day counted at 1 here is a day paid in full, and every day short of the employee's tenure
+// becomes unpaid leave. E was counted at 1 unconditionally. Two consequences, both measured:
+// a REJECTED early-out request and an APPROVED one with byte-identical punches both banked a
+// whole day - 92e238b moved the letter and nothing else, so the rejection was invisible in the
+// only number payroll reads - and a request nobody had decided yet was already banked in full
+// before the approver opened it.
+//
+// MyFastHR_Attendance_Master_Prompt.md's payroll rules have no early-out line at all, so this
+// deliberately does not invent a rate. It reuses the one partial-day weight the system already
+// documents (Half Day, 0.5) for the days an approver has refused or has not yet granted, and
+// leaves every other early-out day at exactly the weight it carries today:
+//   approved           1.0  the shortfall was excused (such a row normally settles to P anyway)
+//   no request at all  1.0  unchanged - nobody has ruled on it, and nothing here should quietly
+//                           start deducting for days that pay in full today
+//   rejected           0.5  an approver ruled the departure unexcused; it must not equal approved
+//   pending            0.5  undecided. 1.0 pre-approves it; 0.0 turns the day into unpaid leave
+//                           in payrollService and so pre-rejects it. The partial day is neither.
+function earlyOutDayWeight(requestStatus) {
+    const state = requestStatus ? String(requestStatus).toLowerCase() : null;
+    if (state === 'rejected' || state === 'pending') return 0.5;
+    return 1;
 }
 
 // The stats increments the muster used to copy-paste five times, each copy covering a slightly
 // different subset of the statuses it could actually be handed.
-function bumpDayStats(stats, status) {
-    if (status === 'P' || status === 'R' || status === 'E') stats.P++;
+//
+// `amount` carries a half-day leave; `earlyOutRequest` carries the approval state, which this
+// cannot infer - the letter E is the same one whether a manager approved, refused or has not
+// yet looked at the request behind it.
+function bumpDayStats(stats, status, ctx = {}) {
+    const { amount = 1, earlyOutRequest = null } = ctx;
+    if (status === 'P' || status === 'R') stats.P += 1;
+    else if (status === 'E') stats.P += earlyOutDayWeight(earlyOutRequest);
     else if (status === 'HD') stats.P += 0.5;
     else if (status === 'L') stats.L++;
     else if (status === 'A') stats.A++;
     else if (status === 'OFF') stats.OFF++;
     else if (status === 'H') stats.H++;
+    else if (status === 'PL') stats.PL += amount;
+    else if (status === 'UL') stats.UL += amount;
 }
 
 function checkIfLogUsedGrace(log, employee, rules) {
@@ -386,6 +551,14 @@ function mapFrontendStatusToDb(status) {
 }
 
 
+// How a completed session reads. Every violation it has, not only the arrival.
+function punchMarks(isLate, isEarly) {
+    const marks = [];
+    if (isLate) marks.push('Late In');
+    if (isEarly) marks.push('Early Out');
+    return marks.length ? marks.join(', ') : 'On-Time';
+}
+
 function calculateSplitShiftStatus(dayLogs, shift, rules) {
     const reqPunches = parseInt(shift.total_punches_required || shift.shift_total_punches || 2);
 
@@ -480,7 +653,10 @@ function calculateSplitShiftStatus(dayLogs, shift, rules) {
                 const outMins = dateToMins(s1Log.check_out);
                 s1Early = outMins < (s1End - grace1Out);
                 s1Present = true;
-                s1PunchText = `S1: ${s1Late ? 'Late' : 'On-Time'} (${safeFormatTime(s1Log.check_in)} - ${safeFormatTime(s1Log.check_out)})`;
+                // Both violations, not just the arrival. A day whose status is E because the
+                // employee left early used to be described as "On-Time" - the letter and the
+                // sentence beside it in the day-detail drawer contradicted each other.
+                s1PunchText = `S1: ${punchMarks(s1Late, s1Early)} (${safeFormatTime(s1Log.check_in)} - ${safeFormatTime(s1Log.check_out)})`;
             } else {
                 const isS1Today = toLocalYMD(s1Log.check_in) === toLocalYMD(new Date());
                 if (isS1Today) {
@@ -505,7 +681,7 @@ function calculateSplitShiftStatus(dayLogs, shift, rules) {
                 const outMins = dateToMins(s2Log.check_out);
                 s2Early = outMins < (s2End - grace2Out);
                 s2Present = true;
-                s2PunchText = `S2: ${s2Late ? 'Late' : 'On-Time'} (${safeFormatTime(s2Log.check_in)} - ${safeFormatTime(s2Log.check_out)})`;
+                s2PunchText = `S2: ${punchMarks(s2Late, s2Early)} (${safeFormatTime(s2Log.check_in)} - ${safeFormatTime(s2Log.check_out)})`;
             } else {
                 let isS2Terminated = false;
                 if (shift.terminate_hour) {
@@ -573,7 +749,7 @@ function calculateSplitShiftStatus(dayLogs, shift, rules) {
 
             return {
                 status,
-                explanation: `S1: ${isLate ? 'Late' : 'On-Time'} (${safeFormatTime(log.check_in)} - ${safeFormatTime(log.check_out)})`,
+                explanation: `S1: ${punchMarks(isLate, isEarly)} (${safeFormatTime(log.check_in)} - ${safeFormatTime(log.check_out)})`,
                 punch_count: 2
             };
         } else {
@@ -1329,7 +1505,9 @@ class AttendanceService {
         };
 
         const weekoffs = typeof rules.weekoffs === 'string' ? JSON.parse(rules.weekoffs) : (rules.weekoffs || []);
-        const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        // Resolved once for the whole grid: "is this day over?" must not change halfway down a
+        // 500-employee month, and every screen has to answer it in IST, not in server-local time.
+        const todayStr = istTodayStr();
 
         // 2. Fetch Raw Data (Employees, Attendance, Leaves, Holidays)
         const holidays = await db('holidays')
@@ -1457,17 +1635,37 @@ class AttendanceService {
             });
         }
 
-        // Pre-parse and group entry/exit requests by employee_id and day
+        // Pre-parse and group entry/exit requests by employee_id and day.
+        //
+        // Two maps out of one query, deliberately. entryRequestsMap keeps its original
+        // APPROVED-only meaning, because that is what resolveDayStatus treats as "an approver
+        // settled this day" - widening it would change status letters. earlyOutStateMap carries
+        // every decision state and feeds only the payroll weight, where a rejection and a
+        // pending request have to be distinguishable from an approval.
         const entryRequestsMap = {};
+        const earlyOutStateMap = {};
+        const STATE_RANK = { approved: 3, pending: 2, rejected: 1 };
         if (raw.entryRequests) {
             raw.entryRequests.forEach(er => {
                 const empId = er.employee_id;
                 const dayYmd = toLocalYMD(er.date);
                 const day = dayYmd ? parseInt(dayYmd.split('-')[2], 10) : new Date(er.date).getDate();
-                if (!entryRequestsMap[empId]) {
-                    entryRequestsMap[empId] = {};
+                const state = String(er.status || '').toLowerCase();
+
+                if (state === 'approved') {
+                    if (!entryRequestsMap[empId]) entryRequestsMap[empId] = {};
+                    entryRequestsMap[empId][day] = er;
                 }
-                entryRequestsMap[empId][day] = er;
+
+                if (er.request_type === 'early_out') {
+                    if (!earlyOutStateMap[empId]) earlyOutStateMap[empId] = {};
+                    // A day can carry more than one request. An approval settles it; failing
+                    // that a live pending request outranks an already-refused one.
+                    const held = earlyOutStateMap[empId][day];
+                    if (!held || (STATE_RANK[state] || 0) > (STATE_RANK[held] || 0)) {
+                        earlyOutStateMap[empId][day] = state;
+                    }
+                }
             });
         }
 
@@ -1510,10 +1708,7 @@ class AttendanceService {
             const empLeaves = leavesMap[emp.id] || [];
 
             for (let d = 1; d <= daysInMonth; d++) {
-                const date = new Date(year, month - 1, d);
-                const dayName = dayNames[date.getDay()];
                 const targetDateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-                const dateTime = date.getTime();
 
                 // 1. Check Attendance (Includes Manual Overrides, Biometric, Regularization, Entry/Exit Requests)
                 // Read BEFORE the shift is resolved: the day's own rows say which shift it was
@@ -1574,63 +1769,23 @@ class AttendanceService {
                         regularization: !!dayRegularization,
                         earlyOutRequest: !!dayEarlyOut
                     });
-                    bumpDayStats(stats, status);
+                    // The letter E is the same whether the early departure was approved,
+                    // refused or is still sitting in an approver's queue, so the request state
+                    // has to travel with it - bumpDayStats cannot see it.
+                    bumpDayStats(stats, status, { earlyOutRequest: earlyOutStateMap[emp.id]?.[d] || null });
                 } else {
-                    // 2. Check Week-offs
-                    if (empWeekoffs.includes(dayName)) {
-                        status = 'OFF';
-                        stats.OFF++;
-                    }
-                    // 3. Check Holidays
-                    else if (holidays.some(h => {
-                        const dayYmd = toLocalYMD(h.date);
-                        return dayYmd && parseInt(dayYmd.split('-')[2], 10) === d;
-                    })) {
-                        status = 'H';
-                        stats.H++;
-                    } else {
-                        // 4. Check Leaves
-                        const onLeave = empLeaves.find(l =>
-                            l.startTime <= dateTime && l.endTime >= dateTime
-                        );
-
-                        if (onLeave) {
-                            const isPaid = !onLeave.leave_type_name.toLowerCase().includes('unpaid') &&
-                                !onLeave.leave_type_name.toLowerCase().includes('lop');
-                            status = isPaid ? 'PL' : 'UL';
-                            const isHalfDay = Number(onLeave.days) === 0.5 &&
-                                toLocalYMD(onLeave.start_date) === toLocalYMD(onLeave.end_date);
-                            const leaveIncrement = isHalfDay ? 0.5 : 1;
-                            if (isPaid) stats.PL += leaveIncrement; else stats.UL += leaveIncrement;
-                        } else {
-                            const today = new Date();
-                            today.setHours(0, 0, 0, 0);
-                            if (date < today) {
-                                status = 'A'; // Absent
-                                stats.A++;
-                            } else if (date.getTime() === today.getTime()) {
-                                const now = new Date();
-                                const shiftEndStr = resolvedShift.end_time || '18:00';
-                                const [h, m] = shiftEndStr.split(':').map(Number);
-                                const terminateHour = parseInt(resolvedShift.terminate_hour || 2);
-                                
-                                const targetDateStr = formatDbDate(date);
-                                const shiftStartStr = resolvedShift.start_time || '09:00';
-                                const [sHours, sMins] = shiftStartStr.split(':').map(Number);
-                                const shiftStartDate = new Date(`${targetDateStr}T${String(sHours).padStart(2, '0')}:${String(sMins).padStart(2, '0')}:00+05:30`);
-                                let shiftEndDate = new Date(`${targetDateStr}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00+05:30`);
-                                if (shiftEndDate < shiftStartDate) {
-                                    shiftEndDate = new Date(shiftEndDate.getTime() + 24 * 60 * 60 * 1000);
-                                }
-                                const terminationDate = new Date(shiftEndDate.getTime() + (terminateHour * 60 * 60 * 1000));
-                                
-                                if (now > terminationDate) {
-                                    status = 'A'; // Absent after shift termination
-                                    stats.A++;
-                                }
-                            }
-                        }
-                    }
+                    // Weekoff -> holiday -> leave -> absent/blank. Shared with the history sheet
+                    // and the date-wise screen, which had no such chain at all - see
+                    // resolveNoLogStatus.
+                    const noLog = resolveNoLogStatus(targetDateStr, {
+                        weekoffs: empWeekoffs,
+                        holidays,
+                        leaves: empLeaves,
+                        shift: resolvedShift,
+                        todayStr
+                    });
+                    status = noLog.status;
+                    bumpDayStats(stats, status, { amount: noLog.amount });
                 }
                 let in1 = null, out1 = null, in2 = null, out2 = null;
                 let isGrace = false;
@@ -2082,12 +2237,37 @@ class AttendanceService {
         const employee = await db('employees as e')
             .leftJoin('shifts as s', 'e.shift_id', 's.id')
             .where('e.id', employeeId)
-            .select('s.*', 's.name as default_shift_name')
+            .select('s.*', 's.name as default_shift_name', 'e.attendance_scheme_id')
             .first();
         const defaultShiftName = employee?.default_shift_name || '---';
 
         const pinnedShifts = await loadPinnedShifts(attendance);
         const rules = await db('working_rules').where({ company_id: companyId }).first() || {};
+
+        // Weekoffs, holidays and leaves. This sheet never fetched any of them, so it called
+        // every Sunday, every company holiday and every approved leave day Absent while the
+        // muster beside it drew OFF, H and PL from the same data - 27 of 30 cells apart on one
+        // measured employee-month. Same three inputs the muster uses, same resolver.
+        const scheme = employee?.attendance_scheme_id
+            ? await db('attendance_schemes').where({ id: employee.attendance_scheme_id }).first()
+            : null;
+        const rawWeekoffs = scheme?.weekoffs ?? rules.weekoffs;
+        const weekoffs = typeof rawWeekoffs === 'string'
+            ? (JSON.parse(rawWeekoffs) || [])
+            : (rawWeekoffs || []);
+
+        const holidays = await db('holidays')
+            .where({ company_id: companyId })
+            .whereBetween('date', [from, to]);
+
+        const leaves = await db('leaves as l')
+            .join('leave_types as lt', 'l.leave_type_id', 'lt.id')
+            .where({ 'l.employee_id': employeeId, 'l.company_id': companyId, 'l.status': 'approved' })
+            .where('l.start_date', '<=', to)
+            .where('l.end_date', '>=', from)
+            .select('l.start_date', 'l.end_date', 'l.days', 'lt.name as leave_type_name');
+
+        const todayStr = istTodayStr();
 
         // The muster treats an approved early-out request / regularization as the day's answer even
         // when no attendance row carries it. This sheet has to see the same two facts or it will
@@ -2132,7 +2312,7 @@ class AttendanceService {
             const historyStatus = resolveDayStatus(dayLogs, shift, rules, {
                 regularization: regularizedDays.has(dateStr),
                 earlyOutRequest: earlyOutDays.has(dateStr)
-            }) || 'A';
+            }) || resolveNoLogStatus(dateStr, { weekoffs, holidays, leaves, shift, todayStr }).status;
 
             sheet.push({
                 date: dateStr,
@@ -2150,6 +2330,7 @@ class AttendanceService {
     async getDateWiseAttendance(companyId, date) {
         const employees = await db('employees')
             .leftJoin('departments', 'employees.department_id', 'departments.id')
+            .leftJoin('attendance_schemes', 'employees.attendance_scheme_id', 'attendance_schemes.id')
             .where({ 'employees.company_id': companyId })
             .select(
                 'employees.id',
@@ -2159,7 +2340,8 @@ class AttendanceService {
                 'employees.shift_id',
                 'employees.office_location',
                 'employees.designation',
-                'departments.name as department_name'
+                'departments.name as department_name',
+                'attendance_schemes.weekoffs as scheme_weekoffs'
             );
 
         // Fetch shift assignments active on this specific date. `s.*` rather than four columns:
@@ -2188,9 +2370,41 @@ class AttendanceService {
 
         const pinnedShifts = await loadPinnedShifts(attendance);
 
+        // The same three overlays the muster applies to a day with no punches. This screen had
+        // none of them and printed Absent against every weekoff, holiday, approved leave and
+        // future date - see resolveNoLogStatus.
+        const companyWeekoffs = typeof rules.weekoffs === 'string'
+            ? (JSON.parse(rules.weekoffs) || [])
+            : (rules.weekoffs || []);
+        const holidays = await db('holidays').where({ company_id: companyId, date });
+        const leaves = await db('leaves as l')
+            .join('leave_types as lt', 'l.leave_type_id', 'lt.id')
+            .where({ 'l.company_id': companyId, 'l.status': 'approved' })
+            .where('l.start_date', '<=', date)
+            .where('l.end_date', '>=', date)
+            .select('l.employee_id', 'l.start_date', 'l.end_date', 'l.days', 'lt.name as leave_type_name');
+
+        // ...and the two facts an approver can add to a day. The muster and the history sheet
+        // both feed these into the resolver; this screen passed no context at all, so an
+        // APPROVED early-out day read E here while the grid beside it read P.
+        const approvedEarlyOuts = await db('attendance_entry_requests')
+            .where({ company_id: companyId, request_type: 'early_out', status: 'approved', date })
+            .select('employee_id');
+        const approvedRegularizations = await db('attendance_regularizations')
+            .where({ company_id: companyId, status: 'approved', date })
+            .select('employee_id');
+        const earlyOutEmployees = new Set(approvedEarlyOuts.map(r => r.employee_id));
+        const regularizedEmployees = new Set(approvedRegularizations.map(r => r.employee_id));
+
+        const todayStr = istTodayStr();
+
         return employees.map(emp => {
             const rosterAssignment = assignments.find(a => a.employee_id === emp.id);
             const defaultShift = shifts.find(s => s.id === emp.shift_id);
+            const empWeekoffs = emp.scheme_weekoffs
+                ? (typeof emp.scheme_weekoffs === 'string' ? JSON.parse(emp.scheme_weekoffs) : emp.scheme_weekoffs)
+                : companyWeekoffs;
+            const empLeaves = leaves.filter(l => l.employee_id === emp.id);
 
             const empLogs = attendance.filter(a => {
                 if (a.employee_id !== emp.id) return false;
@@ -2225,7 +2439,12 @@ class AttendanceService {
                 department_name: emp.department_name,
                 shift_name: shiftName,
                 shift_code: shiftName,
-                status: resolveDayStatus(empLogs, activeShift, rules) || 'A',
+                status: resolveDayStatus(empLogs, activeShift, rules, {
+                    regularization: regularizedEmployees.has(emp.id),
+                    earlyOutRequest: earlyOutEmployees.has(emp.id)
+                }) || resolveNoLogStatus(date, {
+                    weekoffs: empWeekoffs, holidays, leaves: empLeaves, shift: activeShift, todayStr
+                }).status,
                 first_in: empLogs[0] ? safeFormatTime(empLogs[0].check_in) : null,
                 last_out: empLogs[empLogs.length - 1] ? safeFormatTime(empLogs[empLogs.length - 1].check_out) : null,
                 session1: s1Ms > 0 ? `${(s1Ms / 3600000).toFixed(1)}h` : '0.0h',
@@ -3145,11 +3364,21 @@ class AttendanceService {
         // for 'manual'/'manual_override' rows. So an approver could approve a late_in or an
         // early_out, watch the muster settle on L or P, and still find E in the drawer for the same
         // row. The grid, the history sheet and this drawer all read resolveDayStatus now.
+        //
+        // The letter and the sentence beside it must come from the same decision. Overwriting
+        // only `status` left calculateSplitShiftStatus's sentence in place, so the drawer
+        // contradicted itself in two adjacent fields: a rejected early-out showed status E next
+        // to "S1: On-Time (06:00 - 11:00)".
         if (splitShiftDetails) {
-            splitShiftDetails.status = resolveDayStatus(attendanceLogs, activeShift, rules, {
+            const resolved = resolveDayStatusDetail(attendanceLogs, activeShift, rules, {
                 regularization: regularizations.some(r => r.status === 'approved'),
-                earlyOutRequest: entryRequests.some(er => er.request_type === 'early_out' && er.status === 'approved')
-            }) || splitShiftDetails.status;
+                earlyOutRequest: entryRequests.some(er => er.request_type === 'early_out' && er.status === 'approved'),
+                explain: true
+            });
+            if (resolved.status) {
+                splitShiftDetails.status = resolved.status;
+                splitShiftDetails.explanation = resolved.explanation || splitShiftDetails.explanation;
+            }
         }
 
         return {

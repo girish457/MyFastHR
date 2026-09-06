@@ -1,0 +1,602 @@
+#!/usr/bin/env node
+/**
+ * Read-path regression harness — the muster/history/date-wise/day-detail analogue of
+ * replayPunches.js.
+ *
+ * replayPunches.js guards the WRITE path: what processPunch() stores for a sequence of
+ * punches. Nothing guarded the READ path, and that is where the last round of bugs lived:
+ * four screens render the same stored row and each one used to decide for itself what the
+ * row meant. A day could read OFF on the admin grid, Absent on the employee's history sheet
+ * and Absent again on the date-wise screen, with the day-detail drawer showing a status
+ * letter next to a sentence that contradicted it — all from one unchanged database row.
+ *
+ * So this harness seeds deterministic days (every shift type x pinned vs unpinned shift_id x
+ * weekoff / holiday / leave / future-date overlay x the status letters), then asks all four
+ * read functions about the same employee-month and asserts they agree cell for cell. A screen
+ * that starts answering differently from the other three fails here.
+ *
+ * SAFETY: refuses to run against a database whose name is not clearly a scratch database.
+ * It creates and drops its own fixture rows, so pointing it at real data would destroy them.
+ *
+ * Usage:
+ *   npm run readpath:replay              (from backend/, uses myfasthr_readpath_replay)
+ *   DB_NAME=my_scratch_db npm run readpath:replay
+ *
+ * Set up the scratch database once:
+ *   docker exec myfasthr-mysql mysqldump -uroot --no-data --no-tablespaces myfasthr_db \
+ *     > /tmp/schema.sql
+ *   docker exec myfasthr-mysql mysql -uroot -e "DROP DATABASE IF EXISTS myfasthr_readpath_replay; \
+ *     CREATE DATABASE myfasthr_readpath_replay"
+ *   docker exec -i myfasthr-mysql mysql -uroot myfasthr_readpath_replay < /tmp/schema.sql
+ *   DB_NAME=myfasthr_readpath_replay PORT=5062 node src/server.js   # once, so
+ *     syncDatabaseSchema() adds attendance.shift_id / logical_date, then Ctrl-C
+ *
+ * TZ matters. Production runs UTC while all attendance logic is written against
+ * Asia/Kolkata, and several past bugs only reproduced under one of the two. The npm script
+ * pins TZ=Etc/UTC to match production; run it a second time with TZ=Asia/Kolkata when you
+ * touch date handling, and expect identical results.
+ *
+ * The month under test is the PREVIOUS calendar month, so every day in it is settled and the
+ * expectations do not move with the clock. A second, smaller sweep over the CURRENT month
+ * covers the future-date column, which is the one the history sheet used to call Absent.
+ */
+
+const DB_NAME = process.env.DB_NAME || 'myfasthr_readpath_replay';
+
+// Guard before anything requires the knex instance: config/db.js reads the env at import
+// time, so a late check would already have connected to the wrong database.
+if (!/(_replay|_test|_verify|_scratch)$/.test(DB_NAME)) {
+    console.error(
+        `Refusing to run against database "${DB_NAME}".\n` +
+        'This harness inserts and deletes fixture rows. Point DB_NAME at a scratch database\n' +
+        'whose name ends in _replay, _test, _verify or _scratch. See the header of this file.'
+    );
+    process.exit(2);
+}
+process.env.DB_NAME = DB_NAME;
+
+const db = require('../src/config/db');
+const attendanceService = require('../src/services/attendanceService');
+
+// Fixture identifiers, chosen high enough not to collide with anything a schema dump carries.
+const CO = 990201;
+const SH_GEN = 990210;     // 09:00-18:00, 2 punches
+const SH_NIGHT = 990211;   // 22:00-06:00, crosses midnight
+const SH_SPLIT = 990212;   // 09:00-13:00 / 17:00-21:00, 4 punches
+const SH_FLEXI = 990213;   // min_hours only, no clock to be late against
+const LT_PAID = 990220;
+const LT_UNPAID = 990221;
+
+const ADMIN = { company_id: CO, role_name: 'company_admin' };
+
+const results = [];
+let failures = 0;
+
+function check(scenario, label, actual, expected) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    if (!ok) failures++;
+    results.push({ scenario, label, ok, actual, expected });
+}
+
+// ---------------------------------------------------------------------------
+// Dates. Built at UTC noon so no server timezone can push a fixture off its
+// calendar date, which is the whole class of bug this file exists to catch.
+// ---------------------------------------------------------------------------
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const pad = n => String(n).padStart(2, '0');
+
+function ymd(y, m, d) { return `${y}-${pad(m)}-${pad(d)}`; }
+function dayNameOf(y, m, d) { return DAY_NAMES[new Date(Date.UTC(y, m - 1, d, 12)).getUTCDay()]; }
+function daysIn(y, m) { return new Date(Date.UTC(y, m, 0, 12)).getUTCDate(); }
+
+const TODAY = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+const [CUR_Y, CUR_M, CUR_D] = TODAY.split('-').map(Number);
+const PAST_M = CUR_M === 1 ? 12 : CUR_M - 1;
+const PAST_Y = CUR_M === 1 ? CUR_Y - 1 : CUR_Y;
+const PAST_DIM = daysIn(PAST_Y, PAST_M);
+const CUR_DIM = daysIn(CUR_Y, CUR_M);
+
+const P = d => ymd(PAST_Y, PAST_M, d);
+const isSunday = d => dayNameOf(PAST_Y, PAST_M, d) === 'Sunday';
+
+const ALL_DAYS = Array.from({ length: PAST_DIM }, (_, i) => i + 1);
+const WORKDAYS = ALL_DAYS.filter(d => !isSunday(d));
+
+// Scenario days. Taken from the non-Sunday days so the weekoff rule never masks a fixture.
+const D_ONTIME = WORKDAYS[0];
+const D_LATE = WORKDAYS[1];
+const D_EARLY = WORKDAYS[2];
+const D_HALF = WORKDAYS[3];
+// WORKDAYS[4] is deliberately left bare: a plain past workday with no punch, which must read A.
+const D_PENDING = WORKDAYS[5];
+const D_REJECTED = WORKDAYS[6];
+const D_APPROVED = WORKDAYS[7];
+const D_REGULARIZED = WORKDAYS[8];
+const D_PAID_LEAVE = WORKDAYS[9];
+const D_UNPAID_LEAVE = WORKDAYS[10];
+const D_HALF_LEAVE = WORKDAYS[11];
+const D_HOLIDAY = WORKDAYS[WORKDAYS.length - 1];
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+async function resetFixtures() {
+    await db('attendance').where({ company_id: CO }).del();
+    await db('attendance_entry_requests').where({ company_id: CO }).del();
+    await db('attendance_regularizations').where({ company_id: CO }).del();
+    await db('employee_shift_assignments').where({ company_id: CO }).del();
+    await db('leaves').where({ company_id: CO }).del();
+    await db('leave_types').where({ company_id: CO }).del();
+    await db('holidays').where({ company_id: CO }).del();
+    await db('employees').where({ company_id: CO }).del();
+    await db('working_rules').where({ company_id: CO }).del();
+    await db('shifts').where({ company_id: CO }).del();
+    await db('companies').where({ id: CO }).del();
+}
+
+async function seedCommon() {
+    await db('companies').insert({ id: CO, name: 'Read Path Harness Co', email: 'readpath@harness.invalid' });
+    await db('working_rules').insert({
+        company_id: CO, shift_start: '09:00', shift_end: '18:00', grace_period: 15,
+        half_day_hours: 4, weekoffs: JSON.stringify(['Sunday'])
+    });
+
+    const base = {
+        company_id: CO, grace_period: 15, grace_count_limit: 30, is_flexi: 0,
+        total_punches_required: 2, session1_in_margin: 30, session1_out_margin: 5, terminate_hour: 2
+    };
+    await db('shifts').insert([
+        { ...base, id: SH_GEN, name: 'RP General 09-18', start_time: '09:00', end_time: '18:00', min_hours: 9.0 },
+        { ...base, id: SH_NIGHT, name: 'RP Night 22-06', start_time: '22:00', end_time: '06:00', min_hours: 8.0 },
+        {
+            ...base, id: SH_SPLIT, name: 'RP Split 09-13/17-21', start_time: '09:00', end_time: '13:00',
+            min_hours: 8.0, total_punches_required: 4,
+            session2_start_time: '17:00', session2_end_time: '21:00',
+            session2_in_margin: 30, session2_out_margin: 5, session2_grace_in: 15
+        },
+        {
+            ...base, id: SH_FLEXI, name: 'RP Flexi 8h', start_time: '00:00', end_time: '23:59',
+            is_flexi: 1, min_hours: 8.0, session1_in_margin: 0, session1_out_margin: 0, terminate_hour: null
+        }
+    ]);
+
+    await db('leave_types').insert([
+        { id: LT_PAID, company_id: CO, name: 'RP Privilege Leave' },
+        { id: LT_UNPAID, company_id: CO, name: 'RP Unpaid Leave' }
+    ]);
+
+    await db('holidays').insert({
+        company_id: CO, name: 'RP Founders Day', date: P(D_HOLIDAY), type: 'fixed'
+    });
+}
+
+let empSeq = 990300;
+async function makeEmployee(shiftId) {
+    const id = empSeq++;
+    await db('employees').insert({
+        id, company_id: CO, employee_id_number: String(id), first_name: `RP${id}`, last_name: 'Harness',
+        email: `rp${id}@harness.invalid`, status: 'active', shift_id: shiftId
+    });
+    await db('employee_shift_assignments').insert({
+        company_id: CO, employee_id: id, shift_id: shiftId,
+        // Starts well before the month under test so the roster covers every fixture day.
+        from_date: ymd(PAST_Y, PAST_M, 1), to_date: null
+    });
+    return id;
+}
+
+/**
+ * One attendance row. `pin` writes attendance.shift_id — the pin 89b9968 added. Passing
+ * pin:null reproduces every row that predates it, which must still render identically via
+ * the date-based roster fallback.
+ */
+async function punchRow(empId, logicalDay, inTime, outTime, status, opts = {}) {
+    const { pin = null, source = 'biometric', outDay = logicalDay } = opts;
+    await db('attendance').insert({
+        employee_id: empId,
+        company_id: CO,
+        check_in: `${P(logicalDay)} ${inTime}`,
+        check_out: outTime ? `${P(outDay)} ${outTime}` : null,
+        status,
+        punch_source: source,
+        logical_date: P(logicalDay),
+        shift_id: pin
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The employees and what each of their days must read on every screen.
+// ---------------------------------------------------------------------------
+const EMPLOYEES = {};   // key -> { id, shift, expectPast: {day: letter}, expectStats }
+
+function baselinePast() {
+    const grid = {};
+    for (const d of ALL_DAYS) {
+        if (isSunday(d)) grid[d] = 'OFF';
+        else if (d === D_HOLIDAY) grid[d] = 'H';
+        else grid[d] = 'A';
+    }
+    return grid;
+}
+
+async function seedEmployees() {
+    // --- 1. General 2-punch shift, rows PINNED to the shift they were worked under -------
+    const genPinned = await makeEmployee(SH_GEN);
+    await punchRow(genPinned, D_ONTIME, '09:00:00', '18:05:00', 'present', { pin: SH_GEN });
+    await punchRow(genPinned, D_LATE, '09:30:00', '18:05:00', 'late', { pin: SH_GEN });
+    await punchRow(genPinned, D_EARLY, '09:00:00', '13:30:00', 'early_out', { pin: SH_GEN });
+    await punchRow(genPinned, D_HALF, '09:00:00', '12:00:00', 'half-day', { pin: SH_GEN });
+    await db('leaves').insert([
+        {
+            employee_id: genPinned, company_id: CO, leave_type_id: LT_PAID,
+            start_date: P(D_PAID_LEAVE), end_date: P(D_PAID_LEAVE), days: 1,
+            reason: 'rp paid', status: 'approved'
+        },
+        {
+            employee_id: genPinned, company_id: CO, leave_type_id: LT_UNPAID,
+            start_date: P(D_UNPAID_LEAVE), end_date: P(D_UNPAID_LEAVE), days: 1,
+            reason: 'rp unpaid', status: 'approved'
+        },
+        {
+            employee_id: genPinned, company_id: CO, leave_type_id: LT_PAID,
+            start_date: P(D_HALF_LEAVE), end_date: P(D_HALF_LEAVE), days: 0.5,
+            reason: 'rp half paid', status: 'approved'
+        }
+    ]);
+    const genPinnedGrid = baselinePast();
+    genPinnedGrid[D_ONTIME] = 'P';
+    genPinnedGrid[D_LATE] = 'L';
+    genPinnedGrid[D_EARLY] = 'E';
+    genPinnedGrid[D_HALF] = 'HD';
+    genPinnedGrid[D_PAID_LEAVE] = 'PL';
+    genPinnedGrid[D_UNPAID_LEAVE] = 'UL';
+    genPinnedGrid[D_HALF_LEAVE] = 'PL';
+    EMPLOYEES.gen_pinned = { id: genPinned, expectPast: genPinnedGrid };
+
+    // --- 2. Same shift, same punches, shift_id NULL: every pre-89b9968 production row -----
+    const genUnpinned = await makeEmployee(SH_GEN);
+    await punchRow(genUnpinned, D_ONTIME, '09:00:00', '18:05:00', 'present');
+    await punchRow(genUnpinned, D_LATE, '09:30:00', '18:05:00', 'late');
+    await punchRow(genUnpinned, D_EARLY, '09:00:00', '13:30:00', 'early_out');
+    await punchRow(genUnpinned, D_HALF, '09:00:00', '12:00:00', 'half-day');
+    const genUnpinnedGrid = baselinePast();
+    genUnpinnedGrid[D_ONTIME] = 'P';
+    genUnpinnedGrid[D_LATE] = 'L';
+    genUnpinnedGrid[D_EARLY] = 'E';
+    genUnpinnedGrid[D_HALF] = 'HD';
+    EMPLOYEES.gen_unpinned = { id: genUnpinned, expectPast: genUnpinnedGrid };
+
+    // --- 3. Night shift: check-out lands on the next calendar day ------------------------
+    const night = await makeEmployee(SH_NIGHT);
+    await punchRow(night, D_ONTIME, '22:00:00', '06:05:00', 'present', { pin: SH_NIGHT, outDay: D_ONTIME + 1 });
+    await punchRow(night, D_LATE, '22:30:00', '06:05:00', 'late', { pin: SH_NIGHT, outDay: D_LATE + 1 });
+    await punchRow(night, D_EARLY, '22:00:00', '03:00:00', 'early_out', { pin: SH_NIGHT, outDay: D_EARLY + 1 });
+    const nightGrid = baselinePast();
+    nightGrid[D_ONTIME] = 'P';
+    nightGrid[D_LATE] = 'L';
+    nightGrid[D_EARLY] = 'E';
+    EMPLOYEES.night = { id: night, expectPast: nightGrid };
+
+    // --- 4. Split / 4-punch: two rows are the CORRECT shape of one day -------------------
+    const split = await makeEmployee(SH_SPLIT);
+    await punchRow(split, D_ONTIME, '09:00:00', '13:00:00', 'present', { pin: SH_SPLIT });
+    await punchRow(split, D_ONTIME, '17:00:00', '21:00:00', 'present', { pin: SH_SPLIT });
+    await punchRow(split, D_LATE, '09:30:00', '13:00:00', 'late', { pin: SH_SPLIT });
+    await punchRow(split, D_LATE, '17:00:00', '21:00:00', 'present', { pin: SH_SPLIT });
+    await punchRow(split, D_HALF, '09:00:00', '13:00:00', 'present', { pin: SH_SPLIT });
+    const splitGrid = baselinePast();
+    splitGrid[D_ONTIME] = 'P';
+    splitGrid[D_LATE] = 'L';
+    splitGrid[D_HALF] = 'HD';
+    EMPLOYEES.split = { id: split, expectPast: splitGrid };
+
+    // --- 5. Flexi: min_hours is the entire rule ------------------------------------------
+    const flexi = await makeEmployee(SH_FLEXI);
+    await punchRow(flexi, D_ONTIME, '11:20:00', '20:40:00', 'present', { pin: SH_FLEXI });
+    await punchRow(flexi, D_HALF, '11:20:00', '14:00:00', 'half-day', { pin: SH_FLEXI });
+    const flexiGrid = baselinePast();
+    flexiGrid[D_ONTIME] = 'P';
+    flexiGrid[D_HALF] = 'HD';
+    EMPLOYEES.flexi = { id: flexi, expectPast: flexiGrid };
+
+    // --- 6. The request states. Identical 09:00 -> 13:30 punches on all three, and only ---
+    //        the approver's decision separates them.
+    const req = await makeEmployee(SH_GEN);
+    await punchRow(req, D_ONTIME, '09:00:00', '18:05:00', 'present', { pin: SH_GEN });
+    await punchRow(req, D_LATE, '09:30:00', '18:05:00', 'late', { pin: SH_GEN });
+    await punchRow(req, D_EARLY, '09:00:00', '13:30:00', 'early_out', { pin: SH_GEN });
+    await punchRow(req, D_HALF, '09:00:00', '12:00:00', 'half-day', { pin: SH_GEN });
+    // Nobody has decided yet: the engine holds the row at 'pending'.
+    await punchRow(req, D_PENDING, '09:00:00', '13:30:00', 'pending', { pin: SH_GEN });
+    // Rejected: 92e238b settles the held row on what the device recorded.
+    await punchRow(req, D_REJECTED, '09:00:00', '13:30:00', 'early_out', { pin: SH_GEN });
+    // Approved: the shortfall is excused and the row settles to present.
+    await punchRow(req, D_APPROVED, '09:00:00', '13:30:00', 'present', { pin: SH_GEN });
+    await punchRow(req, D_REGULARIZED, '09:00:00', '18:00:00', 'regularized', { pin: SH_GEN, source: 'regularization' });
+    await db('attendance_entry_requests').insert([
+        { company_id: CO, employee_id: req, date: P(D_PENDING), request_type: 'early_out', punch_time: `${P(D_PENDING)} 13:30:00`, status: 'pending' },
+        { company_id: CO, employee_id: req, date: P(D_REJECTED), request_type: 'early_out', punch_time: `${P(D_REJECTED)} 13:30:00`, status: 'rejected' },
+        { company_id: CO, employee_id: req, date: P(D_APPROVED), request_type: 'early_out', punch_time: `${P(D_APPROVED)} 13:30:00`, status: 'approved' }
+    ]);
+    await db('attendance_regularizations').insert({
+        company_id: CO, employee_id: req, date: P(D_REGULARIZED),
+        reason: 'rp regularization', status: 'approved'
+    });
+    const reqGrid = baselinePast();
+    reqGrid[D_ONTIME] = 'P';
+    reqGrid[D_LATE] = 'L';
+    reqGrid[D_EARLY] = 'E';
+    reqGrid[D_HALF] = 'HD';
+    reqGrid[D_PENDING] = 'E';
+    reqGrid[D_REJECTED] = 'E';
+    reqGrid[D_APPROVED] = 'P';
+    reqGrid[D_REGULARIZED] = 'R';
+    EMPLOYEES.req = { id: req, expectPast: reqGrid };
+}
+
+// ---------------------------------------------------------------------------
+// Reading the four screens
+// ---------------------------------------------------------------------------
+async function readMatrix(month, year) {
+    const { matrix } = await attendanceService.getMatrix(ADMIN, month, year);
+    const byEmp = {};
+    matrix.forEach(m => { byEmp[m.id] = m; });
+    return byEmp;
+}
+
+async function readHistory(empId, month, year) {
+    const dim = daysIn(year, month);
+    const sheet = await attendanceService.getEmployeeAttendanceHistory(
+        CO, empId, ymd(year, month, 1), ymd(year, month, dim)
+    );
+    const byDay = {};
+    sheet.forEach(row => { byDay[parseInt(row.date.split('-')[2], 10)] = row.status; });
+    return byDay;
+}
+
+async function readDateWise(month, year) {
+    const dim = daysIn(year, month);
+    const byDay = {};
+    for (let d = 1; d <= dim; d++) {
+        const rows = await attendanceService.getDateWiseAttendance(CO, ymd(year, month, d));
+        const byEmp = {};
+        rows.forEach(r => { byEmp[r.id] = r.status; });
+        byDay[d] = byEmp;
+    }
+    return byDay;
+}
+
+/** Only the cells that differ, so a failure names the disagreement instead of dumping a month. */
+function diffGrid(actual, expected, days) {
+    const out = {};
+    for (const d of days) {
+        const e = expected[d];
+        if (e === undefined || e === null) continue;   // deliberately unasserted (e.g. today)
+        const a = actual[d];
+        if (String(a) !== String(e)) out[d] = `${a} != ${e}`;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios
+// ---------------------------------------------------------------------------
+
+/**
+ * R1: the muster, the history sheet and the date-wise screen must render the same letter for
+ * the same day. Before the shared no-log resolver, history and date-wise had no
+ * weekoff / holiday / leave / future-date chain at all and called every one of those days
+ * Absent.
+ */
+async function scenarioPastMonthAgreement() {
+    const s = 'past month: four screens, one answer';
+    const matrix = await readMatrix(PAST_M, PAST_Y);
+    const dateWise = await readDateWise(PAST_M, PAST_Y);
+
+    for (const [key, emp] of Object.entries(EMPLOYEES)) {
+        const grid = matrix[emp.id] ? matrix[emp.id].days : {};
+        const history = await readHistory(emp.id, PAST_M, PAST_Y);
+        const dw = {};
+        for (const d of ALL_DAYS) dw[d] = dateWise[d][emp.id];
+
+        check(s, `${key}: muster matches the seeded fixtures`, diffGrid(grid, emp.expectPast, ALL_DAYS), {});
+        check(s, `${key}: history sheet matches the muster`, diffGrid(history, grid, ALL_DAYS), {});
+        check(s, `${key}: date-wise screen matches the muster`, diffGrid(dw, grid, ALL_DAYS), {});
+    }
+}
+
+/**
+ * The future-date column. The muster leaves a day that has not happened yet blank; the other
+ * two screens used to print Absent against it, which is what made 21 of one employee's 30
+ * November cells disagree.
+ */
+async function scenarioCurrentMonthFutureDays() {
+    const s = 'current month: future days are blank, not Absent';
+    const matrix = await readMatrix(CUR_M, CUR_Y);
+    const dateWise = await readDateWise(CUR_M, CUR_Y);
+    const days = Array.from({ length: CUR_DIM }, (_, i) => i + 1);
+
+    // Today itself depends on the wall clock (it turns Absent only once the shift has
+    // terminated), so it is asserted for cross-screen agreement but not against a letter.
+    const expected = {};
+    for (const d of days) {
+        if (dayNameOf(CUR_Y, CUR_M, d) === 'Sunday') expected[d] = 'OFF';
+        else if (d < CUR_D) expected[d] = 'A';
+        else if (d > CUR_D) expected[d] = '-';
+        else expected[d] = null;
+    }
+
+    for (const [key, emp] of Object.entries(EMPLOYEES)) {
+        const grid = matrix[emp.id] ? matrix[emp.id].days : {};
+        const history = await readHistory(emp.id, CUR_M, CUR_Y);
+        const dw = {};
+        for (const d of days) dw[d] = dateWise[d][emp.id];
+
+        check(s, `${key}: muster leaves future days blank`, diffGrid(grid, expected, days), {});
+        check(s, `${key}: history sheet matches the muster`, diffGrid(history, grid, days), {});
+        check(s, `${key}: date-wise screen matches the muster`, diffGrid(dw, grid, days), {});
+    }
+}
+
+/**
+ * A pre-89b9968 row (attendance.shift_id NULL) must render exactly as the same day pinned to
+ * its shift. shift_id NULL means "predates the pin", never "no shift".
+ */
+async function scenarioUnpinnedRowsRenderIdentically() {
+    const s = 'unpinned rows (shift_id NULL) render as before';
+    const matrix = await readMatrix(PAST_M, PAST_Y);
+    const pinned = matrix[EMPLOYEES.gen_pinned.id].days;
+    const unpinned = matrix[EMPLOYEES.gen_unpinned.id].days;
+
+    const punchDays = [D_ONTIME, D_LATE, D_EARLY, D_HALF];
+    check(s, 'the four punched days read the same pinned and unpinned',
+        punchDays.map(d => unpinned[d]),
+        punchDays.map(d => pinned[d]));
+
+    const pinnedCount = await db('attendance').where({ company_id: CO, employee_id: EMPLOYEES.gen_unpinned.id }).whereNotNull('shift_id').count({ n: '*' }).first();
+    check(s, 'the fixture really is unpinned', Number(pinnedCount.n), 0);
+}
+
+/**
+ * R3: what an Early Out day is worth to payroll. payrollService computes
+ * paidDays = stats.P + L + OFF + H + PL, so a day counted at 1 here is a day paid in full.
+ */
+async function scenarioEarlyOutPayrollWeight() {
+    const s = 'early out: the approver decision reaches the number payroll reads';
+    const matrix = await readMatrix(PAST_M, PAST_Y);
+    const stats = matrix[EMPLOYEES.req.id].stats;
+
+    // P: on-time 1 + engine early-out 1 + half day 0.5 + pending 0.5 + rejected 0.5
+    //    + approved 1 + regularized 1
+    check(s, 'stats.P for the request employee', stats.P, 5.5);
+    check(s, 'stats.L', stats.L, 1);
+    check(s, 'stats.H', stats.H, 1);
+    check(s, 'stats.OFF', stats.OFF, ALL_DAYS.filter(isSunday).length);
+
+    // The letters are the same on the rejected and the pending day; only the weight differs.
+    const grid = matrix[EMPLOYEES.req.id].days;
+    check(s, 'rejected, pending and un-requested early outs all still read E',
+        [grid[D_REJECTED], grid[D_PENDING], grid[D_EARLY]], ['E', 'E', 'E']);
+    check(s, 'the approved one reads P', grid[D_APPROVED], 'P');
+
+    // The leave employee proves half-day leave still lands as 0.5 in the right bucket.
+    const leaveStats = matrix[EMPLOYEES.gen_pinned.id].stats;
+    check(s, 'paid leave, incl. one half day', leaveStats.PL, 1.5);
+    check(s, 'unpaid leave', leaveStats.UL, 1);
+}
+
+/**
+ * R4: the day-detail drawer must not print a status letter next to a sentence that
+ * contradicts it. The measured symptom was status E beside "S1: On-Time (06:00 - 11:00)".
+ */
+async function scenarioDayDetailAgreesWithItself() {
+    const s = 'day detail: letter and explanation cannot diverge';
+    const matrix = await readMatrix(PAST_M, PAST_Y);
+
+    for (const [key, emp] of Object.entries(EMPLOYEES)) {
+        const grid = matrix[emp.id].days;
+        const statusMismatches = {};
+        const textMismatches = {};
+
+        for (const d of ALL_DAYS) {
+            const detail = await attendanceService.getDayDetail(CO, emp.id, P(d));
+            const ssd = detail.split_shift_details;
+            if (!ssd) continue;   // no punches that day; the drawer shows leave/holiday fields
+            if (ssd.status !== grid[d]) statusMismatches[d] = `${ssd.status} != ${grid[d]}`;
+
+            const text = String(ssd.explanation || '');
+            // A day the drawer calls Early Out or Late In must never be described as On-Time,
+            // and a day it calls Present must not be explained by an unexcused violation.
+            if ((ssd.status === 'E' || ssd.status === 'L') && /On-Time/.test(text) && !/Late|Early Out/.test(text)) {
+                textMismatches[d] = `${ssd.status} explained as "${text}"`;
+            }
+            if (ssd.status === 'P' && /^S\d: (Late|Early Out)/.test(text)) {
+                textMismatches[d] = `${ssd.status} explained as "${text}"`;
+            }
+        }
+
+        check(s, `${key}: drawer status matches the muster on every punched day`, statusMismatches, {});
+        check(s, `${key}: drawer explanation never contradicts its own letter`, textMismatches, {});
+    }
+}
+
+/** The three request states, read straight off the drawer, side by side. */
+async function scenarioRequestStatesInTheDrawer() {
+    const s = 'day detail: the three early-out decisions read differently';
+    const empId = EMPLOYEES.req.id;
+    const read = async (day) => {
+        const detail = await attendanceService.getDayDetail(CO, empId, P(day));
+        return {
+            status: detail.split_shift_details.status,
+            explanation: detail.split_shift_details.explanation
+        };
+    };
+
+    const rejected = await read(D_REJECTED);
+    const approved = await read(D_APPROVED);
+    const pending = await read(D_PENDING);
+    const late = await read(D_LATE);
+
+    check(s, 'rejected early out is E and says so', [rejected.status, /Early Out/.test(rejected.explanation)], ['E', true]);
+    check(s, 'approved early out is P and says so', [approved.status, /^Present/.test(approved.explanation)], ['P', true]);
+    check(s, 'pending early out is E and says so', [pending.status, /Early Out/.test(pending.explanation)], ['E', true]);
+    check(s, 'a late arrival is L and says so', [late.status, /Late/.test(late.explanation)], ['L', true]);
+    check(s, 'rejected and approved do not share an explanation',
+        rejected.explanation === approved.explanation, false);
+}
+
+const SCENARIOS = [
+    scenarioPastMonthAgreement,
+    scenarioCurrentMonthFutureDays,
+    scenarioUnpinnedRowsRenderIdentically,
+    scenarioEarlyOutPayrollWeight,
+    scenarioDayDetailAgreesWithItself,
+    scenarioRequestStatesInTheDrawer
+];
+
+async function main() {
+    console.log(`Read-path replay harness  db=${DB_NAME}  TZ=${process.env.TZ || '(system)'}`);
+    console.log(`  month under test: ${PAST_Y}-${pad(PAST_M)} (settled)  |  current: ${CUR_Y}-${pad(CUR_M)}, today ${TODAY}`);
+    console.log(`  fixture days: ontime=${D_ONTIME} late=${D_LATE} early=${D_EARLY} half=${D_HALF} ` +
+        `pending=${D_PENDING} rejected=${D_REJECTED} approved=${D_APPROVED} regularized=${D_REGULARIZED}`);
+    console.log(`                paid-leave=${D_PAID_LEAVE} unpaid-leave=${D_UNPAID_LEAVE} half-leave=${D_HALF_LEAVE} holiday=${D_HOLIDAY}\n`);
+
+    await resetFixtures();
+    await seedCommon();
+    await seedEmployees();
+
+    for (const scenario of SCENARIOS) {
+        try {
+            await scenario();
+        } catch (error) {
+            failures++;
+            results.push({ scenario: scenario.name, label: 'threw', ok: false, actual: error.message, expected: 'no error' });
+        }
+    }
+
+    let currentScenario = null;
+    for (const r of results) {
+        if (r.scenario !== currentScenario) {
+            currentScenario = r.scenario;
+            console.log(`\n  ${currentScenario}`);
+        }
+        console.log(`    ${r.ok ? 'PASS' : 'FAIL'}  ${r.label}`);
+        if (!r.ok) {
+            console.log(`          expected ${JSON.stringify(r.expected)}`);
+            console.log(`          actual   ${JSON.stringify(r.actual)}`);
+        }
+    }
+
+    const total = results.length;
+    console.log(`\n${total - failures}/${total} assertions passed.`);
+
+    if (process.env.KEEP_FIXTURES !== '1') await resetFixtures();
+    await db.destroy();
+    process.exit(failures ? 1 : 0);
+}
+
+main().catch(async (error) => {
+    console.error('Harness failed to run:', error);
+    try { await db.destroy(); } catch { /* already closed */ }
+    process.exit(1);
+});
