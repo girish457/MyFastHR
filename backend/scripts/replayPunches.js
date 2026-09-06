@@ -59,6 +59,10 @@ const SHIFT_SPLIT_LATE = 990015; // 4-punch, 09:00-13:00 / 19:00-23:30
 // 20:00-05:00 with a 4h terminate_hour, so its checkout window reaches 09:00 the next
 // morning - far enough to swallow an ordinary day-shift arrival, which is the point.
 const SHIFT_NIGHT_LONG = 990016;
+// The ordinary 09:00-18:00 office shift. Its 09:00 start sits inside the 00:00-09:59 window
+// the night-shift lookback watches, so an arrival on it is exactly the punch a night
+// rotation can steal onto the previous day.
+const SHIFT_GENERAL = 990017;
 
 let employeeSeq = 990100;
 
@@ -103,7 +107,8 @@ async function seedCommon() {
         { ...baseShift, id: SHIFT_SPLIT, name: 'Replay Split', start_time: '07:00', end_time: '12:00', total_punches_required: 4, session2_start_time: '18:00', session2_end_time: '23:00', session2_in_margin: 30, session2_out_margin: 5 },
         { ...baseShift, id: SHIFT_LATE, name: 'Replay 12-21', start_time: '12:00', end_time: '21:00' },
         { ...baseShift, id: SHIFT_SPLIT_LATE, name: 'Replay Split Late', start_time: '09:00', end_time: '13:00', total_punches_required: 4, session2_start_time: '19:00', session2_end_time: '23:30', session2_in_margin: 30, session2_out_margin: 5 },
-        { ...baseShift, id: SHIFT_NIGHT_LONG, name: 'Replay 20-05', start_time: '20:00', end_time: '05:00', terminate_hour: 4 }
+        { ...baseShift, id: SHIFT_NIGHT_LONG, name: 'Replay 20-05', start_time: '20:00', end_time: '05:00', terminate_hour: 4 },
+        { ...baseShift, id: SHIFT_GENERAL, name: 'Replay 09-18', start_time: '09:00', end_time: '18:00' }
     ]);
 }
 
@@ -169,6 +174,12 @@ async function rowsFor(employeeId) {
 async function shiftIdsFor(employeeId) {
     const rows = await db('attendance').where({ employee_id: employeeId, company_id: CO }).orderBy('check_in', 'asc');
     return rows.map(r => (r.shift_id === null || r.shift_id === undefined ? null : Number(r.shift_id)));
+}
+
+/** The logical day each of an employee's rows was filed under, in check-in order. */
+async function logicalDatesFor(employeeId) {
+    const rows = await db('attendance').where({ employee_id: employeeId, company_id: CO }).orderBy('check_in', 'asc');
+    return rows.map(r => (r.logical_date ? String(r.logical_date).slice(0, 10) : null));
 }
 
 async function requestsFor(employeeId) {
@@ -846,6 +857,134 @@ async function scenarioSettledRowStillCorrectedBySameDayExit() {
     ]);
 }
 
+/**
+ * A SAME-DAY rotation must not reopen a settled day either.
+ *
+ * scenarioStrayPunchDoesNotReopenSettledDay covers the control: 06:00-15:57 settled under the
+ * 06:00-16:00 shift, a 19:00 stray tap is past that shift's 18:00 termination and is refused.
+ * Enter a rotation to a 12:00-21:00 shift effective the SAME day and the identical punch was
+ * accepted, because termination was measured against the shift the ROSTER now names (which
+ * terminates at 23:00) rather than the one attendance.shift_id says the row was recorded
+ * under. check_out was rewritten to 19:00, the day flipped to 'pending' awaiting an early-out
+ * approval it never needed, and nothing on the row said why.
+ *
+ * A settled row is judged by the shift it ran under. The refused punch is flagged onto that
+ * row, because a punch a roster edit would have used to destroy a finished day is exactly the
+ * thing a human should see rather than have to find in biometric_raw_logs.
+ */
+async function scenarioSameDayRotationCannotReopenSettledDay() {
+    const s = 'same-day rotation cannot reopen a settled day';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    await punch(e.code, '2026-09-10 15:57:00');           // settled under 06:00-16:00
+    await reassign(e.id, SHIFT_LATE, '2026-09-10');       // 12:00-21:00, terminates 23:00
+    const stray = await punch(e.code, '2026-09-10 19:00:00');
+
+    check(s, 'the stray punch is refused', stray, { status: 'skipped', reason: 'Shift terminated' });
+    check(s, 'the settled checkout survives the rotation', (await rowsFor(e.id)).map(r => ({ in: r.in, out: r.out, status: r.status })), [
+        { in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present' }
+    ]);
+    check(s, 'and the refusal is visible on the row', (await rowsFor(e.id))[0].review, 'stray_after_settled_day');
+    check(s, 'no early_out request invented', await requestsFor(e.id), []);
+    check(s, 'the row keeps the shift it ran under', await shiftIdsFor(e.id), [SHIFT_DAY]);
+}
+
+/**
+ * A night-to-day rotation must file the new day on its OWN date.
+ *
+ * The employee is on a 20:00-05:00 night shift and is rotated onto 09:00-18:00 from 09-11.
+ * 09-10 is not worked. Their 09:00 arrival on 09-11 falls in the 00:00-09:59 window the
+ * night-shift lookback watches, and 09-10's roster shift is a night one whose checkout window
+ * runs to exactly 09:00 - so the arrival was pulled back onto 09-10 and pinned to the night
+ * shift. 09-11 then read Absent while 09-10, a day nobody worked, carried a 09:00-18:00 row.
+ *
+ * The lookback only ever asked "was yesterday a night shift, and is this punch still inside
+ * its checkout window". looksLikeArrivalOnPunchDay answers the question it never asked: this
+ * punch is a credible arrival for the shift in force on its OWN day, so it belongs to that
+ * day whatever yesterday was.
+ */
+async function scenarioNightToDayRotationFilesOnItsOwnDay() {
+    const s = 'night-to-day rotation files the day on its own date';
+    const e = await makeEmployee(SHIFT_NIGHT_LONG);        // 20:00-05:00, window reaches 09:00
+    await reassign(e.id, SHIFT_GENERAL, '2026-09-11');     // 09:00-18:00 from the next day
+    await punch(e.code, '2026-09-11 09:00:00');
+    await punch(e.code, '2026-09-11 18:00:00');
+
+    check(s, 'one clean row for the day actually worked', await rowsFor(e.id), [
+        { in: '2026-09-11 09:00:00', out: '2026-09-11 18:00:00', status: 'present', source: 'biometric', review: null }
+    ]);
+    check(s, 'filed on its own day, not pulled back onto the unworked one', await logicalDatesFor(e.id), ['2026-09-11']);
+    check(s, 'pinned to the shift the rotation moved them to', await shiftIdsFor(e.id), [SHIFT_GENERAL]);
+    check(s, 'nothing for a manager to resolve', await requestsFor(e.id), []);
+}
+
+/**
+ * A post-rotation exit beyond MAX_PLAUSIBLE_WORKED_HOURS must never be both lost and silent.
+ *
+ * In at 09:00 on a 09:00-18:00 shift; an admin rotates them onto 16:00-02:00 effective the
+ * SAME day; they leave at 02:00, seventeen hours later. Seventeen hours is more than one
+ * worked shift, so the row is released as stale and the punch is re-read as a fresh arrival -
+ * and then thrown away by the in-margin guard, because 02:00 is nowhere near a 16:00 start.
+ * Net effect: the punch survived only in biometric_raw_logs and the row sat open, 'present'
+ * and unflagged, so no review queue could ever surface it.
+ *
+ * The punch cannot open a day of its own and it is the only candidate exit the row has, so it
+ * closes the row and hands the day to a human, rather than disappearing.
+ */
+async function scenarioLongPostRotationExitIsNotDiscarded() {
+    const s = 'long post-rotation exit is not discarded';
+    const e = await makeEmployee(SHIFT_GENERAL);           // 09:00-18:00
+    await punch(e.code, '2026-09-10 09:00:00');
+    await reassign(e.id, SHIFT_NIGHT, '2026-09-10');       // 16:00-02:00, effective mid-session
+    const exit = await punch(e.code, '2026-09-11 02:00:00');   // 17h after check-in
+
+    check(s, 'the exit is recorded, not discarded', exit.status, 'check-out');
+    check(s, 'it closes the row it came from, flagged for review', await rowsFor(e.id), [
+        {
+            in: '2026-09-10 09:00:00', out: '2026-09-11 02:00:00', status: 'pending',
+            source: 'biometric', review: 'open_row_punch_unplaceable'
+        }
+    ]);
+    check(s, 'no second row invented for a day nobody arrived on', (await rowsFor(e.id)).length, 1);
+}
+
+/**
+ * A night rotation entered over a settled day must not destroy the NEXT day either.
+ *
+ * 09-10 is worked and closed under the 06:00-16:00 shift, then an admin enters an open-ended
+ * 20:00-05:00 rotation from 09-10. 97e7527 made 09-10 survive that, by asking what the day was
+ * RECORDED under instead of what the roster now claims. 09-11 was still lost: the roster says
+ * night there, so the employee's ordinary 06:00 arrival lands fourteen hours before a 20:00
+ * start, misses the in-margin rescue floor, and is discarded outright - the day reads Absent
+ * and the punch exists only in biometric_raw_logs.
+ *
+ * The same pin that saved 09-10 answers this too: the shift this employee's last recorded day
+ * actually ran under is a 06:00 one, and 06:00 is that shift's arrival. With no row on 09-11
+ * to be confused with, recording the punch and flagging it keeps the day; discarding it does
+ * not make the roster any less wrong.
+ */
+async function scenarioArrivalSurvivesARosterThatDoesNotDescribeIt() {
+    const s = 'arrival survives a roster that does not describe it';
+    const e = await makeEmployee(SHIFT_DAY);
+    await punch(e.code, '2026-09-10 06:00:00');
+    await punch(e.code, '2026-09-10 15:57:00');            // 09-10 settled under 06:00-16:00
+    await reassign(e.id, SHIFT_NIGHT_LONG, '2026-09-10');  // open-ended night from 09-10
+
+    const arrival = await punch(e.code, '2026-09-11 06:00:00');
+    check(s, 'the arrival is recorded, not discarded', arrival.status, 'check-in');
+    check(s, 'flagged so the wrong roster is visible', (await rowsFor(e.id))[1].review, 'arrival_outside_roster_shift');
+    check(s, 'filed on its own day', await logicalDatesFor(e.id), ['2026-09-10', '2026-09-11']);
+
+    await punch(e.code, '2026-09-11 16:00:00');
+    const rows = await rowsFor(e.id);
+    check(s, 'two rows, one per day', rows.length, 2);
+    check(s, 'the settled day is untouched', rows[0], {
+        in: '2026-09-10 06:00:00', out: '2026-09-10 15:57:00', status: 'present', source: 'biometric', review: null
+    });
+    check(s, 'and the new day keeps both its punches', { in: rows[1].in, out: rows[1].out },
+        { in: '2026-09-11 06:00:00', out: '2026-09-11 16:00:00' });
+}
+
 const SCENARIOS = [
     scenarioLateTerminationCheckout,
     scenarioStaleRowNotAbsorbed,
@@ -879,7 +1018,11 @@ const SCENARIOS = [
     scenarioArrivalNeverOverwritesSettledRow,
     scenarioSplitDayReassignedToTwoPunchShift,
     scenarioSplitDayControlWithoutReassignment,
-    scenarioSettledRowStillCorrectedBySameDayExit
+    scenarioSettledRowStillCorrectedBySameDayExit,
+    scenarioSameDayRotationCannotReopenSettledDay,
+    scenarioNightToDayRotationFilesOnItsOwnDay,
+    scenarioLongPostRotationExitIsNotDiscarded,
+    scenarioArrivalSurvivesARosterThatDoesNotDescribeIt
 ];
 
 async function main() {

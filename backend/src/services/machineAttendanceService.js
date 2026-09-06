@@ -142,7 +142,25 @@ const REVIEW_REASONS = {
     // pre-dates attendance.shift_id and its session shift had to be re-resolved by date, or
     // the roster was edited between the two punches. The punch is recorded rather than
     // discarded, and flagged so the day is reviewable.
-    CLOSED_BEFORE_SHIFT_START: 'closed_before_shift_start'
+    CLOSED_BEFORE_SHIFT_START: 'closed_before_shift_start',
+    // A punch that would have rewritten this row's already-settled check_out was refused,
+    // because the shift the row was RECORDED under says it arrived after that shift
+    // terminated - while the roster, edited since, would have accepted it. The row is right
+    // as it stands; the flag exists because a punch a roster edit would have used to destroy
+    // a finished day is worth a human's attention rather than a line in biometric_raw_logs.
+    STRAY_AFTER_SETTLED_DAY: 'stray_after_settled_day',
+    // The only candidate exit an open row had could not be placed anywhere: it sits further
+    // from the check-in than any one shift a human could have worked, AND it is not a
+    // credible arrival on its own day either. It closes the row rather than being discarded,
+    // because the alternative is the punch surviving only in biometric_raw_logs while the
+    // row stays open, 'present' and invisible to every review queue - both lost and silent.
+    OPEN_ROW_PUNCH_UNPLACEABLE: 'open_row_punch_unplaceable',
+    // A punch landing before the ROSTER shift's in-margin, on a logical day with no row at
+    // all, that is nevertheless a credible arrival for the shift this employee's last
+    // recorded day actually ran under. The roster has moved them onto a shift that does not
+    // describe the day they are working; the punch is recorded so the day survives and
+    // flagged so the roster gets fixed.
+    ARRIVAL_OUTSIDE_ROSTER_SHIFT: 'arrival_outside_roster_shift'
 };
 
 // Every place that resolves an employee_shift_assignments row onto `employeeWithShift` selects
@@ -351,19 +369,77 @@ async function looksLikeArrivalOnPunchDay(db, employeeId, punchTime, punchDateSt
         .first();
 
     const shift = assigned || (fallbackShiftId ? await db('shifts').where('id', fallbackShiftId).first() : null);
+    return looksLikeArrivalForShift(shift, punchTime, punchDateStr);
+}
+
+/**
+ * The window test behind looksLikeArrivalOnPunchDay, against a shift handed in rather than
+ * resolved from the roster - so the same question can be put to the shift a row was PINNED
+ * to. The roster is editable and retroactive; the pin is what the employee actually worked,
+ * and when the two disagree it is the pin that knows which punches are this person's arrival.
+ *
+ * Accepts a `shifts` row under either of the two column shapes in this file: raw
+ * (session1_in_margin, as prevDayShift and the fallback lookup return) or projected through
+ * ASSIGNED_SHIFT_COLUMNS (shift_in_margin, as shiftById returns). Reading only one of them
+ * would silently fall back to the 30-minute default for the other.
+ */
+function looksLikeArrivalForShift(shift, punchTime, punchDateStr) {
     if (!shift || shift.is_flexi || !shift.start_time) return false;
 
     const [sHours, sMins] = String(shift.start_time).split(':').map(Number);
     const startDate = new Date(`${punchDateStr} ${String(sHours).padStart(2, '0')}:${String(sMins).padStart(2, '0')}:00 +05:30`);
-    const inMargin = shift.session1_in_margin !== undefined && shift.session1_in_margin !== null
-        ? parseInt(shift.session1_in_margin)
-        : 30;
+    const rawMargin = shift.session1_in_margin !== undefined && shift.session1_in_margin !== null
+        ? shift.session1_in_margin
+        : shift.shift_in_margin;
+    const inMargin = rawMargin !== undefined && rawMargin !== null ? parseInt(rawMargin) : 30;
 
     // From the earliest the shift will accept a check-in, to two hours after it starts - the
     // same 2h allowance the in-margin rescue uses for "still arriving for this shift".
     const earliest = new Date(startDate.getTime() - inMargin * 60 * 1000);
     const latest = new Date(startDate.getTime() + 120 * 60 * 1000);
     return punchTime >= earliest && punchTime <= latest;
+}
+
+/**
+ * The most recent day this employee has a RECORDED shift for, before `beforeDate`.
+ *
+ * The roster says what an admin has typed; a pinned row says what the employee was actually
+ * working. When a rotation is entered that does not describe their days, this is the only
+ * surviving evidence of the shift they were really on - and it is what the in-margin guard
+ * asks before throwing an ordinary arrival away.
+ */
+function lastPinnedRowBefore(db, employeeId, companyId, beforeDate) {
+    return db('attendance')
+        .where({ employee_id: employeeId, company_id: companyId })
+        .whereNotNull('shift_id')
+        .whereNotNull('logical_date')
+        .where('logical_date', '<', beforeDate)
+        .orderBy('logical_date', 'desc')
+        .orderBy('check_in', 'desc')
+        .first();
+}
+
+/**
+ * Closes an open row with a punch that has nowhere else to go, and flags the day.
+ *
+ * Reached only when a punch walked away from an open row (past that row's termination and
+ * further from its check-in than one plausible worked shift) and was then refused as a
+ * check-in on its own day too. Discarding it there left the punch in biometric_raw_logs only
+ * AND the row open, 'present' and absent from every review queue. The status is deliberately
+ * 'pending': the span is not one this engine is willing to call a worked day, so the day is
+ * handed to a human rather than asserted as fact.
+ */
+async function closeAbandonedRowWithPunch(db, row, punchTimeStr, deviceSerial) {
+    await db('attendance')
+        .where({ id: row.id })
+        .update({
+            check_out: punchTimeStr,
+            status: 'pending',
+            punch_source: 'biometric',
+            device_id: deviceIdString(deviceSerial),
+            review_reason: REVIEW_REASONS.OPEN_ROW_PUNCH_UNPLACEABLE,
+            updated_at: db.fn.now()
+        });
 }
 
 /**
@@ -653,6 +729,11 @@ class MachineAttendanceService {
         // terminate_hour; recorded on the row and in the audit log so the day is
         // reviewable rather than silently lost.
         let lateTerminationNote = null;
+        // An OPEN row this punch was released from because its shift had terminated and the
+        // span was too long to read as one worked day. Only set on that path, and only ever
+        // consumed by the check-in guards below when they would otherwise discard the punch -
+        // leaving the row orphaned open and the punch nowhere. See REVIEW_REASONS.
+        let abandonedOpenRow = null;
 
         // First check if there is an active check-in on the previous day with NO check-out
         const openPrevDayLog = await db('attendance')
@@ -730,7 +811,18 @@ class MachineAttendanceService {
                 }
                 const prevTerminationTime = new Date(prevShiftEndDate.getTime() + prevTerminateHour * 60 * 60 * 1000);
 
-                if (punchTime <= prevTerminationTime) {
+                // Being inside yesterday's checkout window is not on its own a reason to file
+                // a punch under yesterday. The lookback never asked whether the punch was
+                // plausibly this person's arrival TODAY, so a night-to-day rotation lost two
+                // days at once: the 09:00 arrival on the first day shift sits exactly inside a
+                // 20:00-05:00 shift's window, so it was filed under the (unworked) previous
+                // day and pinned to the night shift, while the day actually worked read Absent.
+                //
+                // looksLikeArrivalOnPunchDay resolves against the roster in force on the
+                // PUNCH's own day, which is the day the rotation applies to - so it says yes
+                // exactly when the employee has been moved onto a shift this punch starts.
+                if (punchTime <= prevTerminationTime
+                    && !(await looksLikeArrivalOnPunchDay(db, employeeId, punchTime, dateStr, employeeWithShift.shift_id))) {
                     targetShiftDate = prevDateStr;
                 }
             }
@@ -940,6 +1032,14 @@ class MachineAttendanceService {
             if (termination.closesOpenRow && !arrivesToday) {
                 lateTerminationNote = termination.note;
             } else if (termination.isPastTermination) {
+                // Remember what we are walking away from. This punch is about to be judged as
+                // a fresh arrival, which is right when it IS one - but when the check-in
+                // guards below then refuse it, the punch is lost and this row is left open,
+                // 'present' and unflagged, which no review queue can see. That is how a
+                // 17-hour post-rotation exit disappeared completely: too long to be one
+                // worked shift, so released here, and nowhere near the new roster shift's
+                // start, so discarded there. The guards below close this row instead.
+                abandonedOpenRow = activeLog;
                 // Shift has terminated! Reset activeLog to null so it forces a check-in today
                 activeLog = null;
 
@@ -968,7 +1068,13 @@ class MachineAttendanceService {
                         }
                         const prevTerminationTime = new Date(prevShiftEndDate.getTime() + prevTerminateHour * 60 * 60 * 1000);
 
-                        if (punchTime <= prevTerminationTime) {
+                        // Same guard as the copy above, for the same reason: this punch has
+                        // just been ruled a fresh arrival rather than the abandoned row's
+                        // checkout, so the one thing it must not then do is get filed under
+                        // yesterday. The two copies must agree or a punch's logical day
+                        // depends on which of them ran.
+                        if (punchTime <= prevTerminationTime
+                            && !(await looksLikeArrivalOnPunchDay(db, employeeId, punchTime, dateStr, employeeWithShift.shift_id))) {
                             targetShiftDate = prevDateStr;
                         }
                     }
@@ -1073,6 +1179,11 @@ class MachineAttendanceService {
             // Set when the rescue below records an early punch anyway; appended to the
             // biometric_raw_logs audit row.
             let inMarginNote = null;
+            // Which flag the rescued row carries. Defaults to the plain early-punch reason;
+            // the roster-mismatch rescue below sets its own, because the two say different
+            // things to whoever reads the review queue ("was this really their arrival?"
+            // versus "this employee is not on the shift the roster claims").
+            let inMarginReviewReason = REVIEW_REASONS.EARLY_BEFORE_IN_MARGIN;
             if (employeeWithShift && !employeeWithShift.shift_is_flexi) {
                 const shiftStart = employeeWithShift.shift_start || '09:00';
                 const inMargin = employeeWithShift.shift_in_margin !== undefined ? parseInt(employeeWithShift.shift_in_margin) : 0;
@@ -1102,18 +1213,69 @@ class MachineAttendanceService {
                         }
 
                         if (punchTime < rescueFloor || latestLog || nearbyEarlyRow) {
-                            await db('biometric_raw_logs').insert({
-                                company_id: companyId,
-                                device_serial: deviceSerial,
-                                employee_code,
-                                punch_time: punchTimeStr,
-                                status: 'skipped',
-                                error_details: `Punch in before allowed margin (earliest allowed: ${earliestCheckIn.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' })})`
-                            });
-                            return { status: 'skipped', reason: 'Punch in before allowed margin' };
-                        }
+                            // Before throwing the punch away, ask the pin what shift this
+                            // employee is actually working.
+                            //
+                            // The 2h rescue floor above assumes the roster describes their
+                            // day, so a punch far outside it is junk. It does not when a
+                            // rotation has been entered that the employee is not on: enter an
+                            // open-ended night shift over a settled day-shift week and every
+                            // subsequent ordinary 06:00 arrival lands fourteen hours before a
+                            // 20:00 start, misses the floor, and is discarded - the day reads
+                            // Absent and the punch exists only in biometric_raw_logs. 97e7527
+                            // saved the settled day from exactly this roster edit by asking
+                            // what the day was RECORDED under; the day AFTER it was still lost.
+                            //
+                            // attendance.shift_id on the employee's last recorded day is that
+                            // same evidence, and the roster cannot rewrite it. If the punch is
+                            // a credible arrival for that shift and this logical day has no
+                            // row to be confused with, record it and flag it - discarding it
+                            // does not make the roster any less wrong, it just also costs the
+                            // employee the day.
+                            let rosterMismatchNote = null;
+                            if (!latestLog && !nearbyEarlyRow) {
+                                const lastPinned = await lastPinnedRowBefore(db, employeeId, companyId, targetShiftDate);
+                                const workedShift = lastPinned ? await shiftById(db, lastPinned.shift_id) : null;
+                                if (workedShift
+                                    && Number(lastPinned.shift_id) !== Number(resolvedShiftId)
+                                    && looksLikeArrivalForShift(workedShift, punchTime, targetShiftDate)) {
+                                    rosterMismatchNote = `Recorded as check-in against a roster that does not describe this day: punch is before the assigned shift's in-margin (earliest allowed ${earliestCheckIn.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' })}) but is a normal arrival for ${workedShift.start_time}-${workedShift.end_time}, the shift this employee's last recorded day actually ran under.`;
+                                }
+                            }
 
-                        inMarginNote = `Recorded as early check-in: punch before the in-margin window (earliest allowed ${earliestCheckIn.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' })}) with no attendance row for ${targetShiftDate}`;
+                            if (!rosterMismatchNote) {
+                                // The punch cannot open a day of its own. If it walked away
+                                // from an open row on the way here, it is that row's only
+                                // candidate exit and closing it beats losing both.
+                                if (abandonedOpenRow) {
+                                    await closeAbandonedRowWithPunch(db, abandonedOpenRow, punchTimeStr, deviceSerial);
+                                    await db('biometric_raw_logs').insert({
+                                        company_id: companyId,
+                                        device_serial: deviceSerial,
+                                        employee_code,
+                                        punch_time: punchTimeStr,
+                                        status: 'synced',
+                                        error_details: `Closed an abandoned open row: punch is neither a plausible span for that row's shift nor a credible arrival on its own day (earliest allowed ${earliestCheckIn.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' })}). Flagged for review.`
+                                    });
+                                    return { status: 'check-out', record_status: 'pending' };
+                                }
+
+                                await db('biometric_raw_logs').insert({
+                                    company_id: companyId,
+                                    device_serial: deviceSerial,
+                                    employee_code,
+                                    punch_time: punchTimeStr,
+                                    status: 'skipped',
+                                    error_details: `Punch in before allowed margin (earliest allowed: ${earliestCheckIn.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' })})`
+                                });
+                                return { status: 'skipped', reason: 'Punch in before allowed margin' };
+                            }
+
+                            inMarginNote = rosterMismatchNote;
+                            inMarginReviewReason = REVIEW_REASONS.ARRIVAL_OUTSIDE_ROSTER_SHIFT;
+                        } else {
+                            inMarginNote = `Recorded as early check-in: punch before the in-margin window (earliest allowed ${earliestCheckIn.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' })}) with no attendance row for ${targetShiftDate}`;
+                        }
                     }
                 }
             }
@@ -1170,6 +1332,23 @@ class MachineAttendanceService {
                         .first();
 
                     if (latestLog || nearbyRow) {
+                        // As in the in-margin guard: a punch refused here that also walked
+                        // away from an open row would leave BOTH lost - the punch in
+                        // biometric_raw_logs only, the row open and unflagged. It closes the
+                        // row it came from instead.
+                        if (abandonedOpenRow) {
+                            await closeAbandonedRowWithPunch(db, abandonedOpenRow, punchTimeStr, deviceSerial);
+                            await db('biometric_raw_logs').insert({
+                                company_id: companyId,
+                                device_serial: deviceSerial,
+                                employee_code,
+                                punch_time: punchTimeStr,
+                                status: 'synced',
+                                error_details: `Closed an abandoned open row: punch is neither a plausible span for that row's shift nor a check-in its own day will accept (checkout window started ${thresholdStr}). Flagged for review.`
+                            });
+                            return { status: 'check-out', record_status: 'pending' };
+                        }
+
                         await db('biometric_raw_logs').insert({
                             company_id: companyId,
                             device_serial: deviceSerial,
@@ -1338,7 +1517,7 @@ class MachineAttendanceService {
                 shift_id: resolvedShiftId,
                 review_reason: checkoutWindowNote
                     ? REVIEW_REASONS.CHECKOUT_WINDOW_UNPAIRED
-                    : (inMarginNote ? REVIEW_REASONS.EARLY_BEFORE_IN_MARGIN : null),
+                    : (inMarginNote ? inMarginReviewReason : null),
                 created_at: db.fn.now()
             });
 
@@ -1376,13 +1555,47 @@ class MachineAttendanceService {
                 // plausible checkout, so this one has to agree or the punch arrives here
                 // only to be discarded and the row stays open anyway. Both now ask the
                 // same function rather than repeating the arithmetic.
-                const termination = assessPunchAfterTermination(
+                const rosterTermination = assessPunchAfterTermination(
                     punchTime,
                     activeLog.check_in,
                     employeeWithShift.shift_start || '09:00',
                     employeeWithShift.shift_end || '18:00',
                     employeeWithShift.shift_terminate_hour
                 );
+
+                // A SETTLED row is judged by the shift it was RECORDED under, never by the
+                // roster's current one.
+                //
+                // While a row is OPEN the pin already governs employeeWithShift, so this
+                // agrees with itself. Once the row closes, the pin is dropped and this test
+                // fell back to the roster - which is editable, and retroactively. Rotate a
+                // 06:00-16:00 day (terminating 18:00) onto a 12:00-21:00 shift (terminating
+                // 23:00) effective the SAME day and a 19:00 stray tap stopped being past
+                // termination: it walked through this guard and rewrote a finished day's
+                // check_out to 19:00, flipped it to 'pending' and raised an early-out request
+                // nobody needed. Without the rotation the identical punch is refused, which
+                // is the whole proof that the roster edit was doing the damage.
+                //
+                // shift_id NULL means the row pre-dates the pin, not that it has no shift, so
+                // those rows keep the date-based resolution they have always had.
+                let termination = rosterTermination;
+                let refusedByPinOnly = false;
+                if (activeLog.check_out !== null && activeLog.shift_id
+                    && Number(activeLog.shift_id) !== Number(resolvedShiftId)) {
+                    const rowShift = await shiftById(db, activeLog.shift_id);
+                    if (rowShift && rowShift.shift_terminate_hour !== null && rowShift.shift_terminate_hour !== undefined) {
+                        // Session-2 rows are judged by the session-2 window, exactly as the
+                        // check-in-side call site does it by hand.
+                        termination = assessPunchAfterTermination(
+                            punchTime,
+                            activeLog.check_in,
+                            isSession2 ? (rowShift.session2_start_time || '14:00') : (rowShift.start_time || '09:00'),
+                            isSession2 ? (rowShift.session2_end_time || '18:00') : (rowShift.end_time || '18:00'),
+                            rowShift.shift_terminate_hour
+                        );
+                        refusedByPinOnly = termination.isPastTermination && !rosterTermination.isPastTermination;
+                    }
+                }
 
                 // closesOpenRow is not sufficient on its own here: unlike the check-in-side
                 // branch, activeLog on this path is routinely a CLOSED row (the 2-punch
@@ -1392,6 +1605,16 @@ class MachineAttendanceService {
                 if (termination.closesOpenRow && activeLog.check_out === null) {
                     lateTerminationNote = lateTerminationNote || termination.note;
                 } else if (termination.isPastTermination) {
+                    // A punch only the pin refused is a punch the roster edit would have used
+                    // to destroy this day. Blocking it silently leaves that near-miss visible
+                    // nowhere but biometric_raw_logs, so the settled row carries the flag -
+                    // the row is right as it stands, but the day is worth a human's eye. The
+                    // ordinary case (no rotation, both windows agree) flags nothing.
+                    if (refusedByPinOnly && !activeLog.review_reason) {
+                        await db('attendance')
+                            .where({ id: activeLog.id })
+                            .update({ review_reason: REVIEW_REASONS.STRAY_AFTER_SETTLED_DAY, updated_at: db.fn.now() });
+                    }
                     await db('biometric_raw_logs').insert({
                         company_id: companyId,
                         device_serial: deviceSerial,
@@ -1399,6 +1622,7 @@ class MachineAttendanceService {
                         punch_time: punchTimeStr,
                         status: 'skipped',
                         error_details: `Punch ignored: shift terminated at ${termination.terminationTimeStr}`
+                            + (refusedByPinOnly ? ' (measured against the shift the settled row was recorded under, not the roster\'s current one)' : '')
                     });
                     return { status: 'skipped', reason: 'Shift terminated' };
                 }
