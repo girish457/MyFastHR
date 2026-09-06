@@ -656,6 +656,49 @@ async function scenarioMyAttendancePayload() {
         ['P', '09:00', '21:00', '8.0']);
 }
 
+
+/**
+ * A company that has NOT configured working rules yet.
+ *
+ * Every screen falls back to a default `working_rules` object when the company has no row,
+ * and there used to be FOUR different inline versions of that object in attendanceService:
+ * the muster's carried weekoffs: ['Sunday'], the history sheet's and the date-wise screen's
+ * were bare `{}`. So a company with no working_rules row resolved its Sundays against an
+ * EMPTY weekoff list on four of the five screens: every past Sunday read OFF on the admin
+ * muster and Absent on the employee's own "My Attendance". A freshly onboarded tenant is
+ * exactly the tenant with no working_rules row, so this hit new customers and nobody else.
+ *
+ * This harness seeds working_rules, which is why it never caught it. So take the row away.
+ */
+async function scenarioNoWorkingRulesRow() {
+    const s = 'a company that has not configured working rules yet';
+    const saved = await db('working_rules').where({ company_id: CO }).first();
+    await db('working_rules').where({ company_id: CO }).del();
+
+    try {
+        const emp = EMPLOYEES.gen_pinned.id;
+        const sundays = ALL_DAYS.filter(isSunday);
+
+        const matrix = await readMatrix(PAST_M, PAST_Y);
+        const sheet = await readHistory(emp, PAST_M, PAST_Y);
+        const dateWise = await readDateWise(PAST_M, PAST_Y);
+        const mine = await attendanceService.getHistory({ id: null, employee_id: emp }, CO, PAST_M, PAST_Y);
+        const mineByDay = {};
+        mine.forEach(r => { mineByDay[parseInt(r.date.split('-')[2], 10)] = r.status; });
+
+        check(s, 'the muster still reads OFF on every Sunday with no working_rules row',
+            sundays.map(d => matrix[emp].days[d]), sundays.map(() => 'OFF'));
+        check(s, 'the history sheet agrees instead of printing Absent',
+            sundays.map(d => sheet[d]), sundays.map(() => 'OFF'));
+        check(s, 'the date-wise screen agrees',
+            sundays.map(d => dateWise[d][emp]), sundays.map(() => 'OFF'));
+        check(s, "and the employee's own screen agrees",
+            sundays.map(d => mineByDay[d]), sundays.map(() => 'OFF'));
+    } finally {
+        if (saved) await db('working_rules').insert(saved);
+    }
+}
+
 const SCENARIOS = [
     scenarioPastMonthAgreement,
     scenarioCurrentMonthFutureDays,
@@ -663,7 +706,8 @@ const SCENARIOS = [
     scenarioEarlyOutPayrollWeight,
     scenarioDayDetailAgreesWithItself,
     scenarioRequestStatesInTheDrawer,
-    scenarioMyAttendancePayload
+    scenarioMyAttendancePayload,
+    scenarioNoWorkingRulesRow
 ];
 
 async function main() {

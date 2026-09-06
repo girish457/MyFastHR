@@ -48,6 +48,21 @@ const {
     mapFrontendStatusToDb
 } = require('./attendance/dayResolver');
 
+// What "this company has not configured working rules yet" means. There were FOUR different
+// inline versions of this object in this file and they disagreed about the one field that is
+// visible to an employee: two of them omitted `weekoffs` entirely. A company with no
+// working_rules row therefore had its Sundays resolved against an EMPTY weekoff list on the
+// history sheet, the date-wise screen and the employee's own "My Attendance", while the muster
+// beside them defaulted to ['Sunday'] - so every past Sunday read OFF on the admin grid and
+// Absent on the employee's own screen. Freshly onboarded companies are exactly the ones with
+// no working_rules row, so this hit new tenants and nobody else.
+// One definition. Spread at each use site so no caller can mutate the shared object.
+const DEFAULT_WORKING_RULES = Object.freeze({
+    shift_start: '09:00',
+    grace_period: 15,
+    weekoffs: JSON.stringify(['Sunday'])
+});
+
 // The one ordering every employee_shift_assignments lookup must use.
 //
 // A knex query modifier, so it stays on this side of the seam - but the RULE it encodes is the
@@ -150,10 +165,7 @@ class AttendanceService {
             .first();
 
         // 2. Fetch Company Rules as Fallback
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {
-            shift_start: '09:00',
-            grace_period: 15
-        };
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
         let status = 'present';
         const now = new Date();
@@ -858,11 +870,7 @@ class AttendanceService {
         const companyId = user.company_id;
 
         // 1. Fetch Company Rules
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {
-            shift_start: '09:00',
-            grace_period: 15,
-            weekoffs: JSON.stringify(['Sunday'])
-        };
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
         const weekoffs = typeof rules.weekoffs === 'string' ? JSON.parse(rules.weekoffs) : (rules.weekoffs || []);
         // Resolved once for the whole grid: "is this day over?" must not change halfway down a
@@ -1314,10 +1322,7 @@ class AttendanceService {
         const formattedDate = `${y}-${m}-${d}`;
 
         // 1. Fetch Company Rules (Fallback)
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {
-            shift_start: '09:00',
-            grace_period: 15
-        };
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
         // 2. Fetch All Employees with Shift Info and Scheme Info
         const employees = await db('employees')
@@ -1623,7 +1628,7 @@ class AttendanceService {
         const defaultShiftName = employee?.default_shift_name || '---';
 
         const pinnedShifts = await loadPinnedShifts(attendance);
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {};
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
         // Weekoffs, holidays and leaves. This sheet never fetched any of them, so it called
         // every Sunday, every company holiday and every approved leave day Absent while the
@@ -1783,7 +1788,7 @@ class AttendanceService {
 
         const shifts = await db('shifts').where({ company_id: companyId });
 
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {};
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
         const nextDate = new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
         const attendance = await db('attendance')
@@ -2318,9 +2323,7 @@ class AttendanceService {
         }
 
         // Fetch company rules
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {
-            weekoffs: JSON.stringify(['Sunday'])
-        };
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
         const companyWeekoffs = typeof rules.weekoffs === 'string' ? JSON.parse(rules.weekoffs) : (rules.weekoffs || []);
 
         // Fetch corporate holidays
@@ -2514,9 +2517,7 @@ class AttendanceService {
         }
 
         // 2. Resolve Weekoff
-        const rules = await db('working_rules').where({ company_id: companyId }).first() || {
-            weekoffs: JSON.stringify(['Sunday'])
-        };
+        const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
         const companyWeekoffs = typeof rules.weekoffs === 'string' ? JSON.parse(rules.weekoffs) : (rules.weekoffs || []);
         const empWeekoffs = emp.scheme_weekoffs
             ? (typeof emp.scheme_weekoffs === 'string' ? JSON.parse(emp.scheme_weekoffs) : emp.scheme_weekoffs)
@@ -3067,10 +3068,7 @@ class AttendanceService {
                         )
                         .first();
 
-                    const rules = await db('working_rules').where({ company_id: companyId }).first() || {
-                        shift_start: '09:00',
-                        grace_period: 15
-                    };
+                    const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
                     const shiftStart = employeeWithShift?.shift_start || rules.shift_start;
                     const grace = employeeWithShift?.scheme_grace ?? employeeWithShift?.shift_grace ?? rules.grace_period;
