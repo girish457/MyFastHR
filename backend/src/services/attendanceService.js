@@ -893,13 +893,35 @@ class AttendanceService {
         const pinnedShifts = await loadPinnedShifts(raw.attendance);
 
         const employeeIds = raw.employees.map(e => e.id);
+        // One day of slack on each side of the month, and it is not cosmetic.
+        //
+        // The attendance query deliberately reaches past the month end - it pulls the small hours
+        // of the 1st of the NEXT month, because a night shift worked on the last day of this month
+        // closes there. If the assignment window stops at the month end, the resolver is shown
+        // those rows but not the roster that governs them: getLogicalDateStr asks which shift the
+        // employee was on for the punch's own calendar day, finds nothing for the 1st, falls back
+        // to an older open-ended night assignment and files the punch under the last day of THIS
+        // month. The next month's grid, whose window does include that assignment, files the same
+        // row under the 1st - so one punch is counted as two present days, once in each month.
+        // Measured on production 2026-09-07: employee 10203's 01 Sep 05:45-16:11 day showed P on
+        // both 31 Aug and 01 Sep, and stats.P is what payroll pays on.
+        //
+        // Widening cannot mis-select anything: every consumer matches an assignment by date
+        // coverage, so a row that only covers 31 Jul or 01 Sep can never be chosen for a day
+        // inside the month.
+        const monthFirst = `${year}-${String(month).padStart(2, '0')}-01`;
+        const monthLast = `${year}-${String(month).padStart(2, '0')}-${daysInMonth}`;
+        const dayBeforeMonth = new Date(new Date(monthFirst).getTime() - 24 * 60 * 60 * 1000)
+            .toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+        const dayAfterMonth = new Date(new Date(monthLast).getTime() + 24 * 60 * 60 * 1000)
+            .toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
         const shiftAssignments = employeeIds.length > 0 ? await db('employee_shift_assignments as esa')
             .join('shifts as s', 'esa.shift_id', 's.id')
             .whereIn('esa.employee_id', employeeIds)
             .where(qb => {
-                qb.where('esa.from_date', '<=', `${year}-${String(month).padStart(2, '0')}-${daysInMonth}`)
+                qb.where('esa.from_date', '<=', dayAfterMonth)
                     .andWhere(qb2 => {
-                        qb2.where('esa.to_date', '>=', `${year}-${String(month).padStart(2, '0')}-01`)
+                        qb2.where('esa.to_date', '>=', dayBeforeMonth)
                             .orWhereNull('esa.to_date');
                     });
             })
@@ -1791,12 +1813,49 @@ class AttendanceService {
         const rules = await db('working_rules').where({ company_id: companyId }).first() || { ...DEFAULT_WORKING_RULES };
 
         const nextDate = new Date(new Date(date).getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
+        const prevDate = new Date(new Date(date).getTime() - 24 * 60 * 60 * 1000).toLocaleDateString('sv-SE', { timeZone: 'Asia/Kolkata' });
         const attendance = await db('attendance')
             .where({ company_id: companyId })
             .where(qb => {
                 qb.whereRaw('DATE(check_in) = ?', [date])
                   .orWhereRaw('DATE(check_in) = ?', [nextDate]);
             });
+
+        // Assignments carrying their REAL validity window, purely so a row can be attributed to
+        // the right logical day. `assignments` above cannot serve: it is filtered to the rendered
+        // date and its select is `s.*`, which carries no esa.from_date/esa.to_date at all, so the
+        // caller below used to synthesise `{ from_date: date, to_date: date }`.
+        //
+        // That synthesis is the bug. getLogicalDateStr answers "which day does a 02:00 punch
+        // belong to" by asking TWO questions: what shift was this employee on for the punch's own
+        // calendar day, and what shift were they on the day BEFORE it. A window collapsed to a
+        // single day can never answer the second one, so the lookup fell through to the
+        // employee's default shift - a DAY shift for most people here - and the resolver concluded
+        // the punch belonged to its own calendar day. A night-shift employee whose row opens at
+        // 02:00 (the rescued/unpaired punches this engine now records deliberately) therefore
+        // showed on this screen one day later than on the muster, the history sheet, the day
+        // detail and the employee's own screen, all four of which pass the real windows.
+        //
+        // Range: rows are loaded for `date` and `nextDate`, and the resolver looks one day back
+        // from whichever of those a row sits on, so [prevDate, nextDate] is everything it can ask
+        // about. Rows created since attendance.logical_date exists never reach this path at all -
+        // rowLogicalDate prefers the persisted column - so this only repairs legacy rows.
+        const logicalDateRows = await db('employee_shift_assignments as esa')
+            .join('shifts as s', 'esa.shift_id', 's.id')
+            .where('esa.company_id', companyId)
+            .where('esa.from_date', '<=', nextDate)
+            .andWhere(function () {
+                this.where('esa.to_date', '>=', prevDate).orWhereNull('esa.to_date');
+            })
+            .select('esa.employee_id', 's.*', 'esa.from_date', 'esa.to_date')
+            .modify(byEffectiveAssignment);
+        // Grouped once for the whole screen rather than re-filtered per employee per row, which
+        // is what the old inline `.filter()` did on every one of ~233 x N comparisons.
+        const logicalDateAssignments = new Map();
+        for (const row of logicalDateRows) {
+            if (!logicalDateAssignments.has(row.employee_id)) logicalDateAssignments.set(row.employee_id, []);
+            logicalDateAssignments.get(row.employee_id).push(row);
+        }
 
         const pinnedShifts = await loadPinnedShifts(attendance);
 
@@ -1838,19 +1897,10 @@ class AttendanceService {
                 : companyWeekoffs;
             const empLeaves = leaves.filter(l => l.employee_id === emp.id);
 
+            const empAssignments = logicalDateAssignments.get(emp.id) || [];
             const empLogs = attendance.filter(a => {
                 if (a.employee_id !== emp.id) return false;
-                
-                const empAssignments = assignments.filter(asg => asg.employee_id === emp.id);
-                const formattedAssignments = empAssignments.map(asg => ({
-                    from_date: date,
-                    to_date: date,
-                    start_time: asg.start_time,
-                    end_time: asg.end_time,
-                    grace_period: asg.grace_period
-                }));
-                
-                const logLogicalDate = rowLogicalDate(a, formattedAssignments, defaultShift);
+                const logLogicalDate = rowLogicalDate(a, empAssignments, defaultShift);
                 return logLogicalDate === date;
             });
             // The shift the day was recorded under outranks the roster, so this screen labels and

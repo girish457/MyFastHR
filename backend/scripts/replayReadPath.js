@@ -699,6 +699,152 @@ async function scenarioNoWorkingRulesRow() {
     }
 }
 
+/**
+ * A LEGACY night-shift row - no logical_date, opening in the small hours - must land on the
+ * same day on the date-wise screen as it does on the other four.
+ *
+ * Found in production on 2026-09-07, one row out of 233: employee on a 16:00-02:00 shift whose
+ * row opened at 02:00, shown Present by date-wise on the calendar day and Absent by the muster,
+ * the history sheet, the day detail and the employee's own screen - which had it on the night
+ * shift's day, correctly.
+ *
+ * getDateWiseAttendance was handing the resolver assignments whose validity window it had
+ * rewritten to the single rendered date. getLogicalDateStr needs to ask what shift the employee
+ * was on the day BEFORE the punch; a one-day window cannot answer that, so the lookup fell
+ * through to employees.shift_id. Two conditions are therefore both required to reproduce, and
+ * the fixture sets both deliberately:
+ *   - the roster assignment is a NIGHT shift (so the row really does belong to the day before), and
+ *   - employees.shift_id is a DAY shift (so the fallback gives the wrong answer rather than
+ *     accidentally the right one).
+ * An employee whose default shift is also the night shift passes even with the bug present.
+ *
+ * Rows written since attendance.logical_date exists are immune - rowLogicalDate prefers the
+ * persisted column - so the fixture row is inserted raw, with logical_date NULL, to stand for
+ * the ~200 legacy rows still in production.
+ */
+async function scenarioLegacyNightRowOnDateWise() {
+    const s = 'a legacy 02:00 night row lands on the same day on all five screens';
+
+    // A day whose successor is also an ordinary workday, so neither cell is a weekoff or the
+    // seeded holiday and the assertion is about the logical date and nothing else.
+    const day = WORKDAYS.find(d => d + 1 <= PAST_DIM && !isSunday(d + 1) && d !== D_HOLIDAY && d + 1 !== D_HOLIDAY);
+    const nextDay = day + 1;
+
+    const id = empSeq++;
+    await db('employees').insert({
+        id, company_id: CO, employee_id_number: String(id), first_name: `RP${id}`, last_name: 'Harness',
+        email: `rp${id}@harness.invalid`, status: 'active',
+        // The DAY shift, deliberately disagreeing with the roster below.
+        shift_id: SH_GEN
+    });
+    await db('employee_shift_assignments').insert({
+        company_id: CO, employee_id: id, shift_id: SH_NIGHT,
+        from_date: ymd(PAST_Y, PAST_M, 1), to_date: null
+    });
+    // Legacy shape: logical_date and shift_id both NULL, as every row written before this
+    // column existed. Opens at 02:00, inside the tail of the 22:00-06:00 shift that started
+    // on `day`, and never closes - the unpaired-punch shape the engine now records on purpose.
+    await db('attendance').insert({
+        employee_id: id, company_id: CO,
+        check_in: `${P(nextDay)} 02:00:00`,
+        check_out: null,
+        status: 'present',
+        punch_source: 'biometric',
+        logical_date: null,
+        shift_id: null
+    });
+
+    // WHICH DAY the row is attributed to is the thing under test, and the status LETTER does not
+    // reveal it: a never-closed row reads A on both days, so a screen can file the punch under
+    // the wrong date and still print a letter that matches. The arrival time does reveal it -
+    // it appears against exactly one of the two days - so that is what is asserted.
+    const arrivalOn = async (dayNum) => {
+        const rows = await attendanceService.getDateWiseAttendance(CO, P(dayNum));
+        return (rows.find(r => r.id === id) || {}).first_in ?? null;
+    };
+    const sheet = await attendanceService.getEmployeeAttendanceHistory(CO, id, P(day), P(nextDay));
+    const sheetArrival = d => (sheet.find(r => r.date === P(d)) || {}).first_in ?? null;
+
+    check(s, 'the history sheet files the 02:00 punch under the night shift\'s own day',
+        [sheetArrival(day), sheetArrival(nextDay)], ['02:00', null]);
+    check(s, 'date-wise files it under the same day, not the calendar day',
+        [await arrivalOn(day), await arrivalOn(nextDay)], ['02:00', null]);
+
+    // ...and having moved it, every screen must still agree on the letter for both days.
+    const matrix = await readMatrix(PAST_M, PAST_Y);
+    const grid = matrix[id].days;
+    const dateWise = await readDateWise(PAST_M, PAST_Y);
+    const history = await readHistory(id, PAST_M, PAST_Y);
+    const mine = await readMyAttendance(id, PAST_M, PAST_Y);
+    check(s, 'all five screens still agree on the letter for both days',
+        [dateWise[day][id], history[day], mine[day], dateWise[nextDay][id], history[nextDay], mine[nextDay]],
+        [grid[day], grid[day], grid[day], grid[nextDay], grid[nextDay], grid[nextDay]]);
+}
+
+/**
+ * A punch in the small hours of the 1st must be counted in ONE month, not both.
+ *
+ * The muster loads attendance past the month end - a night shift worked on the last day closes
+ * in the small hours of the 1st - but used to load the roster only up to the month end. The
+ * resolver was therefore shown the row without the assignment that governs it, fell back to an
+ * older open-ended night assignment and filed the punch under the last day of the month it was
+ * rendering. The following month, whose window did include that assignment, filed the same row
+ * under the 1st. One punch, two Present days, and stats.P is the number payroll pays on.
+ *
+ * Found on production 2026-09-07 while fixing the date-wise placement bug: employee 10203 read
+ * P on both 31 Aug and 01 Sep off a single 05:45-16:11 day.
+ *
+ * The fixture is that exact shape: a night-shift employee rotated onto a DAY shift for the 1st
+ * alone, who works that day shift. The rotation row is what the month-scoped window used to
+ * miss.
+ */
+async function scenarioMonthBoundaryNotCountedTwice() {
+    const s = 'a punch on the 1st is counted in one month, not both';
+
+    const id = empSeq++;
+    await db('employees').insert({
+        id, company_id: CO, employee_id_number: String(id), first_name: `RP${id}`, last_name: 'Harness',
+        email: `rp${id}@harness.invalid`, status: 'active', shift_id: SH_NIGHT
+    });
+    await db('employee_shift_assignments').insert([
+        // The standing night roster, open-ended - the row the resolver used to fall back to.
+        { company_id: CO, employee_id: id, shift_id: SH_NIGHT, from_date: ymd(PAST_Y, PAST_M, 1), to_date: null },
+        // ...and a one-day rotation onto the DAY shift for the 1st of the FOLLOWING month, which
+        // a window ending at the month end cannot see.
+        { company_id: CO, employee_id: id, shift_id: SH_GEN, from_date: ymd(CUR_Y, CUR_M, 1), to_date: ymd(CUR_Y, CUR_M, 1) }
+    ]);
+    // Worked the day shift on the 1st: 09:00-18:05, opening at 09:00 which is inside the
+    // 00:00-10:00 window where the night-shift lookback runs. Legacy shape on purpose.
+    await db('attendance').insert({
+        employee_id: id, company_id: CO,
+        check_in: `${ymd(CUR_Y, CUR_M, 1)} 09:00:00`,
+        check_out: `${ymd(CUR_Y, CUR_M, 1)} 18:05:00`,
+        status: 'present', punch_source: 'biometric',
+        logical_date: null, shift_id: null
+    });
+
+    const pastGrid = (await readMatrix(PAST_M, PAST_Y))[id].days;
+    const curGrid = (await readMatrix(CUR_M, CUR_Y))[id].days;
+
+    // Assert on WHERE the arrival shows, not on the letter: the last day of the previous month
+    // may itself be the seeded holiday, and both H and A mean "carried no punch", so a letter
+    // comparison would be testing the calendar rather than the attribution.
+    const arrivalOn = async (dateStr) => {
+        const rows = await attendanceService.getDateWiseAttendance(CO, dateStr);
+        return (rows.find(r => r.id === id) || {}).first_in ?? null;
+    };
+    check(s, 'the last day of the previous month carries no arrival',
+        await arrivalOn(P(PAST_DIM)), null);
+    check(s, 'the 1st carries it',
+        [await arrivalOn(ymd(CUR_Y, CUR_M, 1)), curGrid[1]], ['09:00', 'P']);
+    check(s, 'and it is counted once, not once per month',
+        (await readMatrix(PAST_M, PAST_Y))[id].stats.P + (await readMatrix(CUR_M, CUR_Y))[id].stats.P,
+        1);
+    check(s, 'date-wise agrees with the muster on both days',
+        [(await readDateWise(PAST_M, PAST_Y))[PAST_DIM][id], (await readDateWise(CUR_M, CUR_Y))[1][id]],
+        [pastGrid[PAST_DIM], curGrid[1]]);
+}
+
 const SCENARIOS = [
     scenarioPastMonthAgreement,
     scenarioCurrentMonthFutureDays,
@@ -707,7 +853,9 @@ const SCENARIOS = [
     scenarioDayDetailAgreesWithItself,
     scenarioRequestStatesInTheDrawer,
     scenarioMyAttendancePayload,
-    scenarioNoWorkingRulesRow
+    scenarioNoWorkingRulesRow,
+    scenarioLegacyNightRowOnDateWise,
+    scenarioMonthBoundaryNotCountedTwice
 ];
 
 async function main() {
